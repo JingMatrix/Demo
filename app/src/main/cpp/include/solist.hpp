@@ -106,24 +106,51 @@ inline T *getStaticPointer(const SandHook::ElfImg &linker, const char *name) {
   return addr == NULL ? NULL : *addr;
 }
 
-static void DropSoPath(const char *target_path) {
+static SoInfo *DetectZygisk(const char *mark) {
   if (solist == NULL && !Initialize()) {
     LOGE("Failed to initialize solist");
-    return;
+    return NULL;
   }
-  SoInfo *prev = NULL;
+  SoInfo *prev = solist;
+  size_t gap = 0;
+  auto gap_repeated = 0;
+
+  SoInfo *stats_jni = NULL;
+
   for (auto iter = solist; iter; iter = iter->get_next()) {
-    if (prev != NULL && iter->get_name() && iter->get_path() &&
-        strstr(iter->get_path(), target_path)) {
-      SoList::ProtectedDataGuard guard;
-      prev->set_next(iter->get_next());
-      if (iter == *sonext) {
-        *sonext = prev;
-      }
-      LOGI("Dropped solist record for %s loaded at %s", iter->get_name(),
-           iter->get_path());
+
+    // No soinfo has its both name and path empty
+    if (iter->get_name()[0] == '\0' && iter->get_path()[0] == '\0') {
+      return iter;
+    }
+
+    if (stats_jni == NULL && strcmp(iter->get_name(), "libstats_jni.so") == 0) {
+      stats_jni = iter;
+    }
+
+    if (iter - prev != gap && gap_repeated == 0) {
+      gap = iter - prev;
+    } else if (iter - prev == gap) {
+      LOGD("Skip %p: %s", iter, iter->get_name());
+      gap_repeated++;
+    } else if (iter - prev == 2 * gap) {
+      // A gap appears, indicating that one library was unloaded
+      auto dropped = (SoInfo *)((uintptr_t)prev + gap);
+      if (strstr(prev->get_name(), mark) || strstr(iter->get_name(), mark))
+        return dropped;
+    } else {
+      gap_repeated--;
+      LOGD("Strange gap 0x%lx or 0x%lx != 0x%lx between %s and %s", iter - prev,
+           prev - iter, gap, prev->get_name(), iter->get_name());
     }
     prev = iter;
+  }
+
+  if (stats_jni == NULL || stats_jni->get_next() != *sonext) {
+    // libstats_jni should be loaded exactly before current library libdemo.so
+    return stats_jni;
+  } else {
+    return NULL;
   }
 }
 

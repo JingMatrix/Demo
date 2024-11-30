@@ -12,6 +12,7 @@ cmake_minimum_required(VERSION 3.22.1)
 project("demo")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CXX_STANDARD 20)
 
 # Creates and names a library, sets it as either STATIC
 # or SHARED, and provides the relative paths to its source code.
