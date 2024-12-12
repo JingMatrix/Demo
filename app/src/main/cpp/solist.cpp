@@ -32,7 +32,7 @@ SoInfo *DetectInjection() {
     }
 
     if (iter->get_name() == NULL &&
-        strstr(iter->get_path(), "/system/bin/app_proces")) {
+        strstr(iter->get_path(), "/system/bin/app_process")) {
       app_process_loaded = true;
       // /system/bin/app_process64 maybe set null name
       LOGD("Skip %s, gap size", iter, iter->get_path());
