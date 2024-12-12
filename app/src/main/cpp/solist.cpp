@@ -39,6 +39,16 @@ SoInfo *DetectInjection() {
       continue;
     }
 
+    if (
+      strncmp(iter->get_path(), "/system/", strlen("/system/")) != 0 &&
+      strncmp(iter->get_path(), "/apex/", strlen("/apex/")) != 0 &&
+      strcmp(iter->get_path(), "[vdso]") != 0
+    ) {
+      LOGW("Found suspicious library: 0x%lx (%s)", iter, iter->get_path());
+
+      return iter;
+    }
+
     if (iter - prev != gap && gap_repeated < 1) {
       gap = iter - prev;
       gap_repeated = 0;
