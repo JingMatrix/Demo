@@ -41,11 +41,21 @@ SoInfo *DetectInjection() {
     }
 
     if (iter->get_name() == NULL &&
-        strstr(iter->get_path(), "/system/bin/app_proces")) {
+        strstr(iter->get_path(), "/system/bin/app_process")) {
       app_process_loaded = true;
       // /system/bin/app_process64 maybe set null name
       LOGD("Skip %s, gap size", iter, iter->get_path());
       continue;
+    }
+
+    if (
+      strncmp(iter->get_path(), "/system/", strlen("/system/")) != 0 &&
+      strncmp(iter->get_path(), "/apex/", strlen("/apex/")) != 0 &&
+      strcmp(iter->get_path(), "[vdso]") != 0
+    ) {
+      LOGW("Found suspicious library: 0x%lx (%s)", iter, iter->get_path());
+
+      return iter;
     }
 
     if (iter - prev != gap && gap_repeated < 1) {
