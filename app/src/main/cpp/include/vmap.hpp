@@ -34,4 +34,6 @@ struct MapInfo {
 };
 
 MapInfo *DetectInjection();
+
+void DumpStackStrings();
 } // namespace VirtualMap

@@ -16,6 +16,7 @@ Java_org_matrix_demo_MainActivity_stringFromJNI(JNIEnv *env,
   SoList::SoInfo *abnormal_soinfo = SoList::DetectInjection();
   VirtualMap::MapInfo *abnormal_vmap = VirtualMap::DetectInjection();
   size_t module_injected = SoList::DetectModules();
+  VirtualMap::DumpStackStrings();
 
   if (abnormal_soinfo != nullptr) {
     solist_detection =
@@ -32,8 +33,8 @@ Java_org_matrix_demo_MainActivity_stringFromJNI(JNIEnv *env,
   }
 
   if (module_injected > 0) {
-    counter_detection =
-        std::format("Module counter: {} shared libraries unloaded", module_injected);
+    counter_detection = std::format(
+        "Module counter: {} shared libraries unloaded", module_injected);
   }
 
   return env->NewStringUTF(

@@ -9,6 +9,58 @@
 
 namespace VirtualMap {
 
+void logPossibleStrings(const char *start, size_t size,
+                        size_t min_string_length = 4) {
+  const char *end = start + size;
+  const char *ptr = start;
+
+  LOGD("--- Starting String Dump (min length: %zu, range size: %zu) ---",
+       min_string_length, size);
+
+  while (ptr < end) {
+    // Find the beginning of a potential string (a printable character)
+    if (isprint(static_cast<unsigned char>(*ptr))) {
+      const char *string_start = ptr;
+      const char *string_end = ptr + 1;
+
+      // Find the end of the sequence of printable characters
+      while (string_end < end &&
+             isprint(static_cast<unsigned char>(*string_end))) {
+        string_end++;
+      }
+
+      size_t length = string_end - string_start;
+
+      // If the sequence meets our minimum length, log it
+      if (length >= min_string_length) {
+        // Safely create a std::string from the non-null-terminated segment
+        std::string found_str(string_start, length);
+
+        // Log the string and its memory offset using LOGD's format string
+        LOGI("Offset 0x%zx: \"%s\"", (size_t)(string_start - start),
+             found_str.c_str());
+      }
+
+      // Advance the main pointer past the sequence we just processed
+      ptr = string_end;
+    } else {
+      // Not a printable character, just move to the next byte
+      ptr++;
+    }
+  }
+  LOGD("--- Finished String Dump ---");
+}
+
+void DumpStackStrings() {
+  for (auto &map : MapInfo::Scan()) {
+    if (map.dev == 0 && map.inode == 0 && map.offset == 0 &&
+        map.path == "[anon:stack_and_tls:main]") {
+      logPossibleStrings(reinterpret_cast<const char *>(map.start),
+                         map.end - map.start, 3);
+    }
+  }
+}
+
 MapInfo *DetectInjection() {
   int jit_cache_count = 0;
   int jit_zygote_cache_count = 0;
