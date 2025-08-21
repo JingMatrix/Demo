@@ -16,11 +16,11 @@ size_t DetectModules() {
 }
 
 SoInfo *DetectInjection() {
-  if (solist == NULL && !Initialize()) {
+  if (solinker == NULL && !Initialize()) {
     LOGE("Failed to initialize solist");
     return NULL;
   }
-  SoInfo *prev = solist;
+  SoInfo *prev = solinker;
   size_t gap = 0;
   auto gap_repeated = 0;
   bool app_process_loaded = false;
@@ -30,7 +30,7 @@ SoInfo *DetectInjection() {
   bool nativehelper_loaded =
       false; // Not necessarily loaded after AppSpecialize
 
-  for (auto iter = solist; iter; iter = iter->get_next()) {
+  for (auto iter = solinker; iter; iter = iter->get_next()) {
     // No soinfo has empty path name
     if (iter->get_path() == NULL || iter->get_path()[0] == '\0') {
       return iter;
@@ -69,7 +69,7 @@ SoInfo *DetectInjection() {
     } else {
       gap_repeated--;
       if (gap != 0)
-        LOGD("Suspicious gap 0x%lx or 0x%lx != 0x%lx between %s and %s",
+        LOGI("Suspicious gap 0x%lx or 0x%lx != 0x%lx between %s and %s",
              iter - prev, prev - iter, gap, prev->get_name(), iter->get_name());
     }
 
@@ -97,67 +97,93 @@ bool Initialize() {
   SandHook::ElfImg linker("/linker");
   if (!ProtectedDataGuard::setup(linker))
     return false;
+  LOGI("found symbol ProtectedDataGuard");
 
-  std::string_view solist_sym_name =
-      linker.findSymbolNameByPrefix("__dl__ZL6solist");
-  if (solist_sym_name.empty())
+  std::string_view somain_sym_name =
+      linker.findSymbolNameByPrefix("__dl__ZL6somain");
+  if (somain_sym_name.empty())
     return false;
+  LOGI("found symbol name %s", somain_sym_name.data());
 
   /* INFO: The size isn't a magic number, it's the size for the string:
    * .llvm.7690929523238822858 */
   char llvm_sufix[25 + 1];
 
-  if (solist_sym_name.length() != strlen("__dl__ZL6solist")) {
-    strncpy(llvm_sufix, solist_sym_name.data() + strlen("__dl__ZL6solist"),
+  if (somain_sym_name.length() != strlen("__dl__ZL6somain")) {
+    strncpy(llvm_sufix, somain_sym_name.data() + strlen("__dl__ZL6somain"),
             sizeof(llvm_sufix));
   } else {
     llvm_sufix[0] = '\0';
   }
 
-  solist = getStaticPointer<SoInfo>(linker, solist_sym_name.data());
-  if (solist == NULL)
-    return false;
+  char solinker_sym_name[sizeof("__dl__ZL8solinker") + sizeof(llvm_sufix)];
+  snprintf(solinker_sym_name, sizeof(solinker_sym_name), "__dl__ZL8solinker%s",
+           llvm_sufix);
 
-  char somain_sym_name[sizeof("__dl__ZL6somain") + sizeof(llvm_sufix)];
-  snprintf(somain_sym_name, sizeof(somain_sym_name), "__dl__ZL6somain%s",
+  // for SDK < 36 (Android 16), the linker binary is loaded with name solist
+  char solist_sym_name[sizeof("__dl__ZL6solist") + sizeof(llvm_sufix)];
+  snprintf(solist_sym_name, sizeof(solist_sym_name), "__dl__ZL6solist%s",
            llvm_sufix);
 
   char sonext_sym_name[sizeof("__dl__ZL6sonext") + sizeof(llvm_sufix)];
-  snprintf(sonext_sym_name, sizeof(somain_sym_name), "__dl__ZL6sonext%s",
+  snprintf(sonext_sym_name, sizeof(sonext_sym_name), "__dl__ZL6sonext%s",
            llvm_sufix);
 
-  char vdso_sym_name[sizeof("__dl__ZL4vdso") + sizeof(llvm_sufix)];
-  snprintf(vdso_sym_name, sizeof(vdso_sym_name), "__dl__ZL4vdso%s", llvm_sufix);
-
-  somain = getStaticPointer<SoInfo>(linker, somain_sym_name);
-  if (somain == NULL)
-    return false;
-
-  sonext = linker.getSymbAddress<SoInfo **>(sonext_sym_name);
-  if (sonext == NULL)
-    return false;
-
-  SoInfo *vdso = getStaticPointer<SoInfo>(linker, vdso_sym_name);
+  solinker = getStaticPointer<SoInfo>(linker, solinker_sym_name);
+  if (solinker == nullptr) {
+    solinker = getStaticPointer<SoInfo>(linker, solist_sym_name);
+    if (solinker == nullptr)
+      return false;
+    LOGI("found symbol solist at %p", solinker);
+  } else {
+    LOGI("found symbol solinker at %p", solinker);
+  }
 
   SoInfo::get_realpath_sym =
       reinterpret_cast<decltype(SoInfo::get_realpath_sym)>(
           linker.getSymbAddress("__dl__ZNK6soinfo12get_realpathEv"));
-  SoInfo::get_soname_sym = reinterpret_cast<decltype(SoInfo::get_soname_sym)>(
-      linker.getSymbAddress("__dl__ZNK6soinfo10get_sonameEv"));
+  if (SoInfo::get_realpath_sym != nullptr)
+    LOGI("found symbol get_realpath_sym");
 
   g_module_unload_counter = reinterpret_cast<decltype(g_module_unload_counter)>(
       linker.getSymbAddress("__dl__ZL23g_module_unload_counter"));
-  if (g_module_unload_counter != NULL)
-    LOGD("found symbol g_module_unload_counter");
+  if (g_module_unload_counter != nullptr)
+    LOGI("found symbol g_module_unload_counter");
 
-  for (size_t i = 0; i < 1024 / sizeof(void *); i++) {
-    auto *possible_next = *(void **)((uintptr_t)solist + i * sizeof(void *));
-    if (possible_next == somain || (vdso != NULL && possible_next == vdso)) {
-      SoInfo::solist_next_offset = i * sizeof(void *);
-      break;
+  somain = getStaticPointer<SoInfo>(linker, somain_sym_name.data());
+  if (solinker == nullptr)
+    return false;
+  LOGI("found symbol somain at %p", somain);
+
+  return findHeuristicOffsets(linker.name());
+}
+
+bool findHeuristicOffsets(std::string linker_name) {
+  const size_t size_block_range = 1024;
+  const size_t linker_realpath_size = linker_name.size();
+
+  bool field_realpath_found = false;
+  for (size_t i = 0; i < size_block_range / sizeof(void *); i++) {
+    auto field_of_solinker =
+        reinterpret_cast<uintptr_t>(solinker) + i * sizeof(void *);
+    auto size_of_somain = *reinterpret_cast<size_t *>(
+        reinterpret_cast<uintptr_t>(somain) + i * sizeof(void *));
+
+    std::string *realpath_of_solinker =
+        reinterpret_cast<std::string *>(field_of_solinker);
+    if (realpath_of_solinker->size() == linker_realpath_size) {
+      if (strcmp(linker_name.c_str(), realpath_of_solinker->c_str()) == 0) {
+        SoInfo::solist_realpath_offset = i * sizeof(void *);
+        LOGI("heuristic field_realpath_offset is %zu * %zu = %p", i,
+             sizeof(void *),
+             reinterpret_cast<void *>(SoInfo::solist_realpath_offset));
+        field_realpath_found = true;
+        break;
+      }
     }
   }
 
-  return (SoInfo::get_realpath_sym != NULL && SoInfo::get_soname_sym != NULL);
+  return field_realpath_found;
 }
+
 } // namespace SoList

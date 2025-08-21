@@ -8,14 +8,13 @@ class SoInfo {
 public:
 #ifdef __LP64__
   inline static size_t solist_next_offset = 0x28;
-  constexpr static size_t solist_realpath_offset = 0x1a8;
+  inline static size_t solist_realpath_offset = 0x1a0;
 #else
   inline static size_t solist_next_offset = 0xa4;
-  constexpr static size_t solist_realpath_offset = 0x174;
+  inline static size_t solist_realpath_offset = 0x17c;
 #endif
 
   inline static const char *(*get_realpath_sym)(SoInfo *) = NULL;
-  inline static const char *(*get_soname_sym)(SoInfo *) = NULL;
 
   inline SoInfo *get_next() {
     return *(SoInfo **)((uintptr_t)this + solist_next_offset);
@@ -29,11 +28,8 @@ public:
   }
 
   inline const char *get_name() {
-    if (get_soname_sym)
-      return get_soname_sym(this);
-
     return ((std::string *)((uintptr_t)this + solist_realpath_offset -
-                            sizeof(void *)))
+                            sizeof(std::string)))
         ->c_str();
   }
 
@@ -86,7 +82,7 @@ private:
   };
 };
 
-static SoInfo *solist = NULL;
+static SoInfo *solinker = NULL;
 static SoInfo *somain = NULL;
 static SoInfo **sonext = NULL;
 static uint64_t *g_module_unload_counter = NULL;
@@ -102,6 +98,7 @@ inline T *getStaticPointer(const SandHook::ElfImg &linker, const char *name) {
 
 SoInfo *DetectInjection();
 size_t DetectModules();
+bool findHeuristicOffsets(std::string linker_name);
 
 bool Initialize();
 
