@@ -1,3 +1,4 @@
+#include "atexit.hpp"
 #include "logging.h"
 #include "smap.h"
 #include "solist.hpp"
@@ -17,6 +18,10 @@ Java_org_matrix_demo_MainActivity_stringFromJNI(JNIEnv *env,
   VirtualMap::MapInfo *abnormal_vmap = VirtualMap::DetectInjection();
   size_t module_injected = SoList::DetectModules();
   VirtualMap::DumpStackStrings();
+  auto g_array = Atexit::findAtexitArray();
+  if (g_array != nullptr) {
+    LOGD("g_array status: %s", g_array->format_state_string().c_str());
+  }
 
   if (abnormal_soinfo != nullptr) {
     solist_detection =
