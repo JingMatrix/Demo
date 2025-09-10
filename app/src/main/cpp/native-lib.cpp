@@ -1,4 +1,5 @@
 #include "atexit.hpp"
+#include "fstatfs.hpp"
 #include "logging.h"
 #include "smap.h"
 #include "solist.hpp"
@@ -22,6 +23,7 @@ Java_org_matrix_demo_MainActivity_stringFromJNI(JNIEnv *env,
   if (g_array != nullptr) {
     LOGD("g_array status: %s", g_array->format_state_string().c_str());
   }
+  check_system_fds();
 
   if (abnormal_soinfo != nullptr) {
     solist_detection =
