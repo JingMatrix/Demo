@@ -41,6 +41,8 @@ class MainActivity : AppCompatActivity() {
                 }, 200) // Double click time window
             }
         }
+
+         KeyStoreTestRunner().runAllTests()
     }
 
     /**
