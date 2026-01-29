@@ -25,6 +25,8 @@ class KeyStoreTestRunner {
         private const val EC_KEY_ALIAS = "org.matrix.demo.ec_test_key"
         private const val RSA_SIGN_KEY_ALIAS = "org.matrix.demo.rsa_sign_test_key"
         private const val RSA_ENCRYPT_KEY_ALIAS = "org.matrix.demo.rsa_encrypt_test_key"
+        private const val NON_EXISTENT_KEY_ALIAS = "org.matrix.demo.non_existent_key"
+        private val LARGE_KEY_ALIAS: String = "a".repeat(507 * 1024 + 269)
     }
 
     /**
@@ -40,6 +42,8 @@ class KeyStoreTestRunner {
         results["EC Sign & Verify"] = testEcSignAndVerify()
         results["RSA Sign & Verify"] = testRsaSignAndVerify()
         results["RSA Encrypt & Decrypt"] = testRsaEncryptAndDecrypt()
+        results["Get Non-Existent Key"] = testGetNonExistentKey()
+        results["Generation with Large Alias"] = testLargeAliasGeneration()
 
         Log.d(TAG, "=============================================")
         Log.d(TAG, "               Test Summary")
@@ -90,6 +94,30 @@ class KeyStoreTestRunner {
         } finally {
             deleteKey(EC_KEY_ALIAS)
             Log.d(TAG, "--- Finished Test: EC Sign & Verify ---\n")
+        }
+    }
+
+    /**
+     * Tests the generation with a large key alias.
+     * @return `true` if all steps succeed, `false` otherwise.
+     */
+    fun testLargeAliasGeneration(): Boolean {
+        Log.d(TAG, "--- Starting Test: Generation with Large Alias ---")
+        try {
+            val spec = KeyGenParameterSpec.Builder(
+                LARGE_KEY_ALIAS,
+                KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
+            ).setDigests(KeyProperties.DIGEST_SHA256).build()
+
+            val keyPair = generateKeyPair(KeyProperties.KEY_ALGORITHM_EC, spec) ?: return false
+            Log.i(TAG, "EC KeyPair generated with large alias successfully.")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Generation test with large alias failed with exception.", e)
+            return false
+        } finally {
+            deleteKey(LARGE_KEY_ALIAS)
+            Log.d(TAG, "--- Finished Test: Generation with Large Alias ---\n")
         }
     }
 
@@ -182,6 +210,36 @@ class KeyStoreTestRunner {
             deleteKey(RSA_ENCRYPT_KEY_ALIAS)
             Log.d(TAG, "--- Finished Test: RSA Encrypt & Decrypt ---\n")
         }
+    }
+
+    /**
+     * Tests that attempting to retrieve a non-existent key correctly returns null.
+     * @return `true` if the key is not found as expected, `false` otherwise.
+     */
+    fun testGetNonExistentKey(): Boolean {
+        Log.d(TAG, "--- Starting Test: Get Non-Existent Key ---")
+        var success = false
+        try {
+            // First, ensure the key does not exist from a previous failed run.
+            deleteKey(NON_EXISTENT_KEY_ALIAS)
+
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            val key = keyStore.getKey(NON_EXISTENT_KEY_ALIAS, null)
+
+            if (key == null) {
+                Log.i(TAG, "getKey correctly returned null for a non-existent alias. PASSED.")
+                success = true
+            } else {
+                Log.e(TAG, "getKey unexpectedly returned a key for a non-existent alias. FAILED.")
+                success = false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Get non-existent key test failed with exception.", e)
+            success = false
+        } finally {
+            Log.d(TAG, "--- Finished Test: Get Non-Existent Key ---\n")
+        }
+        return success
     }
 
     /**
