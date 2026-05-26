@@ -29,7 +29,7 @@ set(CMAKE_CXX_STANDARD 20)
 # used in the AndroidManifest.xml file.
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
-        atexit.cpp elf_util.cpp native-lib.cpp smap.cpp solist.cpp vmap.cpp)
+        hardware.cpp native-lib.cpp prop.cpp)
 
 target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC include)
 # Specifies libraries CMake should link to your target library. You
@@ -37,4 +37,4 @@ target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC include)
 # build script, prebuilt third-party libraries, or Android system libraries.
 target_link_libraries(${CMAKE_PROJECT_NAME}
         # List libraries link to the target library
-        android log)
+        android log EGL GLESv2)
