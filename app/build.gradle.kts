@@ -23,7 +23,6 @@ android {
     buildTypes {
         release {
             vcsInfo.include = false
-            signingConfig = signingConfigs["debug"]
             optimization {
                 enable = true
                 keepRules {
