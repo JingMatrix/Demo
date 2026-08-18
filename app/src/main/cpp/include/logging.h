@@ -1,7 +1,10 @@
 #pragma once
 
 #include <android/log.h>
+#include <cstdarg>
+#include <cstdio>
 #include <errno.h>
+#include <string>
 
 #ifndef LOG_TAG
 #define LOG_TAG "Demo"
@@ -22,10 +25,19 @@
   LOGE(fmt " failed with %d: %s", ##args, errno, strerror(errno))
 
 namespace logging {
+// Optional in-process capture so a caller (e.g. integrity.cpp) can return the raw
+// detection log to the UI. Empty/unused unless capture() is cleared and read.
+inline std::string &capture() {
+  static std::string buf;
+  return buf;
+}
 inline void log(int prio, const char *tag, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  __android_log_vprint(prio, tag, fmt, ap);
+  char line[2048];
+  vsnprintf(line, sizeof(line), fmt, ap);
   va_end(ap);
+  __android_log_print(prio, tag, "%s", line);
+  capture().append(line).append("\n");
 }
 } // namespace logging
