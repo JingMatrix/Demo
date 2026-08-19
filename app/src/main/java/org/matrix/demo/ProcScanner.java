@@ -51,6 +51,45 @@ final class ProcScanner {
     private ProcScanner() {
     }
 
+    // The mount-trace detection core lives in native librecon.so: mount
+    // reconciliation (statx/statfs vs mountinfo), the orphaned-mount and peer-group
+    // consistency checks -- the mount checks the main process runs, ported here so
+    // the isolated probe carries them too. Only MOUNT traces are shared; the
+    // injection detections (solist/vmap/atexit) stay main-process only.
+    private static boolean sReconLoaded;
+
+    static {
+        try {
+            System.loadLibrary("recon");
+            sReconLoaded = true;
+        } catch (Throwable t) {
+            sReconLoaded = false;
+            Log.w(TAG, "librecon.so unavailable: " + t);
+        }
+    }
+
+    private static native String nativeReconcile();
+
+    /** Run the native mount reconciliation; never throws (loading may fail). */
+    private static JSONObject reconcile() {
+        if (!sReconLoaded) {
+            return null;
+        }
+        try {
+            String json = nativeReconcile();
+            JSONObject o = json == null ? null : new JSONObject(json);
+            if (o != null) {
+                pwarn("RECONCILE hidden=" + o.optInt("hidden")
+                        + " structural=" + o.optInt("structural")
+                        + "  (kernel stat vs mountinfo; survives mountinfo filtering)");
+            }
+            return o;
+        } catch (Throwable t) {
+            Log.w(TAG, "nativeReconcile failed: " + t);
+            return null;
+        }
+    }
+
     // Progress log mirrored into the JSON ("log" array) so the app can show it on a
     // Logs page. Milestones only (not the per-record dumps), to stay small.
     private static List<String> gLog = new ArrayList<>();
@@ -146,6 +185,7 @@ final class ProcScanner {
             JSONArray markerSummary = markerSummary(procs);
             out.put("markerHits", markerSummary);
 
+            out.put("reconcile", reconcile());
             out.put("differential", differentialByFile(procs));
             out.put("crossFile", crossFileDiff(procs));
             out.put("selfVsInit", selfVsInit(procs, selfPid));
@@ -263,6 +303,16 @@ final class ProcScanner {
             // namespaces, so comparing raw lines invents differences that no probe sees.
             List<String> keys = new ArrayList<>(lines.size());
             for (String l : lines) {
+                if (isDataIsolationMount(l, kind)) {
+                    // Android's per-process app-data isolation (Android 11+) mounts a bare
+                    // tmpfs over the data dirs a process must not see. Which dirs get covered
+                    // depends on the process's uid/type, so two processes in the SAME
+                    // propagation class legitimately differ by exactly these mounts. Leaving
+                    // them in inflates distinctViews past propagationClasses and fires the
+                    // Privisolated differential on stock. They are not part of the view that
+                    // propagation governs, so drop them before keying.
+                    continue;
+                }
                 keys.add(normalizeKey(l, kind));
             }
             Collections.sort(keys);
@@ -315,6 +365,58 @@ final class ProcScanner {
             }
         }
         return line;
+    }
+
+    /** Data dirs that Android covers with a per-process isolation tmpfs. Prefix-matched, so
+     *  "/data/user" also covers "/data/user_de" and "/data/user/<n>". */
+    private static final String[] DATA_ISOLATION_POINTS = {
+        "/data/data",
+        "/data/user",
+        "/data/user_de",
+        "/data/user_ce",
+        "/data/misc/profiles/cur",
+        "/data/misc/profiles/ref",
+        "/data/misc_ce",
+        "/data/misc_de",
+    };
+
+    /**
+     * True for a benign app-data-isolation mount: a bare {@code tmpfs} the platform stacks
+     * over a per-app / per-user data dir to blind a process to data it may not read. Keyed
+     * narrowly (type must be tmpfs) so a module's bind/overlay over the same path -- which
+     * carries a real source and a non-"/" root -- is NOT swallowed and still diverges views.
+     * mountstats has no per-line type field and stays untouched.
+     */
+    private static boolean isDataIsolationMount(String line, String kind) {
+        String point;
+        String type;
+        if (kind.equals("mountinfo")) {
+            try {
+                MountInfo m = MountInfo.parseLine(line);
+                point = m.point;
+                type = m.type;
+            } catch (RuntimeException e) {
+                return false;
+            }
+        } else if (kind.equals("mounts")) {
+            String[] p = line.split(" ");
+            if (p.length < 3) {
+                return false;
+            }
+            point = p[1];
+            type = p[2];
+        } else {
+            return false;
+        }
+        if (!"tmpfs".equals(type)) {
+            return false;
+        }
+        for (String prefix : DATA_ISOLATION_POINTS) {
+            if (point.equals(prefix) || point.startsWith(prefix + "/")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
@@ -372,7 +474,11 @@ final class ProcScanner {
             }
             int distinct = byView.size();
             int classes = Integer.bitCount(classesMask);
-            boolean mismatch = distinct != classes && distinct > 0;
+            // Injection can only ADD a per-process view, so the signal is strictly more
+            // views than propagation classes justify. distinct < classes just means two
+            // classes happen to share identical content (common once benign per-process
+            // isolation mounts are normalized out) and is not evidence of tampering.
+            boolean mismatch = distinct > classes;
 
             JSONObject o = new JSONObject();
             o.put("distinctViews", distinct);
@@ -565,6 +671,21 @@ final class ProcScanner {
 
     private static JSONObject buildVerdict(JSONObject scan) throws JSONException {
         List<String> reasons = new ArrayList<>();
+
+        // Authoritative: kernel stat ground truth vs mountinfo. Unlike everything
+        // below it, this is immune to kernel-side mountinfo filtering.
+        JSONObject recon = scan.optJSONObject("reconcile");
+        if (recon != null) {
+            int hidden = recon.optInt("hidden");
+            int structural = recon.optInt("structural");
+            if (hidden > 0) {
+                reasons.add(hidden + " mount(s) hidden from mountinfo but confirmed by the kernel (statx/statfs)");
+            }
+            if (structural > 0) {
+                reasons.add(structural + " mountinfo tree anomaly(ies): orphaned mount or peer-group gap from an erased record");
+            }
+        }
+
         int highHits = 0;
         JSONArray hits = scan.optJSONArray("markerHits");
         if (hits != null) {
@@ -583,7 +704,7 @@ final class ProcScanner {
                 JSONObject d = diff.optJSONObject(f);
                 if (d != null && d.optBoolean("mismatch")) {
                     reasons.add("differential mismatch in " + f + " (distinctViews="
-                            + d.optInt("distinctViews") + " != classes="
+                            + d.optInt("distinctViews") + " > classes="
                             + d.optInt("propagationClasses") + ")");
                 }
             }

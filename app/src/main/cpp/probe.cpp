@@ -20,6 +20,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "recon.hpp"
+
 #define LOG_TAG "DemoProbe"
 #define STATUS_OK 0
 
@@ -49,8 +51,11 @@ static const Marker MARKERS[] = {
     {"susfs", "susfs", 3, false}, {"/debug_ramdisk", "debug_ramdisk", 3, false},
     {"meta-overlayfs", "meta-overlayfs", 3, false}, {"apatch", "APatch", 3, false},
     {"sui", "Sui", 2, true}, {"riru", "Riru", 2, true}, {"lsp", "LSP", 2, true},
-    {"worker", "worker", 2, false}, {"lowerdir", "overlay-lowerdir", 2, false},
-    {"upperdir", "overlay-upperdir", 2, false}, {"data_mirror", "data_mirror", 2, false},
+    // Dropped worker/lowerdir/upperdir/data_mirror at MEDIUM: the overlay option
+    // words ride on every stock overlayfs mount and /data_mirror is a stock AOSP
+    // tree (installd CE/DE + profile mirrors), so at conf 2 they only produced
+    // benign LEAK lines on clean devices. A module overlay is still caught by
+    // "/data/adb" in its lowerdir value (conf 3) and by meta-overlayfs/magisk/etc.
     {"overlay", "overlay", 1, false}, {"/dev/block/loop", "loop-dev", 1, false},
     {"tmpfs", "tmpfs", 1, false},
 };
@@ -234,16 +239,24 @@ static void run_probe(void) {
     }
     o += snprintf(g_report + o, cap - o, "],");
 
-    // Root verdict is ONLY the module markers. shared:N propagation is reported as an
-    // informational signature, not detection: a native zygote_next child is forked
-    // without CLONE_NEWNS on STOCK Android 17 too, so "shared:1" is expected here and
-    // hiding it would be the real anomaly.
-    bool detected = high_hits > 0;
+    // Mount reconciliation: kernel stat ground truth vs mountinfo text. Survives
+    // kernel-side mountinfo filtering, so it fires even when every marker line was
+    // erased from this process's view.
+    char recon_json[8192];
+    int recon_findings = recon_run_json(recon_json, sizeof(recon_json));
+    o += snprintf(g_report + o, cap - o, "\"reconcile\":%s,", recon_json);
+
+    // Verdict combines the module markers with the reconciliation (hidden mounts AND
+    // structural anomalies). shared:N propagation stays informational: a native
+    // zygote_next child is forked without CLONE_NEWNS on STOCK Android 17 too, so
+    // "shared:1" is expected here and hiding it would be the real anomaly.
+    bool detected = high_hits > 0 || recon_findings > 0;
     bool global_view = strncmp(prop, "shared:", 7) == 0;
     o += snprintf(g_report + o, cap - o,
-                  "\"verdict\":{\"detected\":%s,\"highHits\":%d,\"propagation\":\"%s\","
-                  "\"globalViewSignature\":%s}}",
-                  detected ? "true" : "false", high_hits, prop, global_view ? "true" : "false");
+                  "\"verdict\":{\"detected\":%s,\"highHits\":%d,\"reconFindings\":%d,"
+                  "\"propagation\":\"%s\",\"globalViewSignature\":%s}}",
+                  detected ? "true" : "false", high_hits, recon_findings, prop,
+                  global_view ? "true" : "false");
 
     g_report_len = o;
     logmsg("native verdict: detected=%s highHits=%d lines=%d json=%zuB",

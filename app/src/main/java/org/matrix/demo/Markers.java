@@ -47,7 +47,11 @@ final class Markers {
         new Marker("susfs", "susfs", HIGH, false),
         new Marker("/debug_ramdisk", "debug_ramdisk", HIGH, false),
         new Marker("meta-overlayfs", "meta-overlayfs", HIGH, false),
-        new Marker("modules", "modules", HIGH, false),
+        // Anchored to "/adb/modules": root modules live under /data/adb/modules, so this
+        // still catches Magisk/KSU/APatch module bind mounts (their root is /adb/modules/...)
+        // while no longer matching benign OEM paths that merely contain "modules" -- e.g.
+        // OnePlus/Oppo's com.oplus.moduleservices, which the bare needle flagged HIGH.
+        new Marker("/adb/modules", "adb-modules", HIGH, false),
         new Marker("apatch", "APatch", HIGH, false),
         new Marker("/sbin/su", "su-bin", HIGH, false),
 
@@ -55,12 +59,14 @@ final class Markers {
         // Dropped the generic overlay-option words (workdir/upperdir/lowerdir), "gsi"
         // and "worker": they also appear in stock overlays/paths. A module overlay is
         // still caught by "/data/adb" inside its lowerdir value, so nothing is lost.
-        // "mirror" -> "data_mirror" so it matches KernelSU's mirror dir, not any path.
+        // Also dropped "data_mirror": /data_mirror is a stock AOSP top-level mount
+        // (vold/installd stage CE/DE storage and ART profile mirrors under it since
+        // Android 11), so the needle fired on every unmodified device. A module's
+        // mirror is still caught by "/data/adb" inside its root/lowerdir value.
         new Marker("sui", "Sui", MEDIUM, true),
         new Marker("lsp", "LSP", MEDIUM, true),
         new Marker("riru", "Riru", MEDIUM, true),
         new Marker("zn", "ZN", MEDIUM, true),
-        new Marker("data_mirror", "data_mirror", MEDIUM, true),
     };
 
     static final class Hit {

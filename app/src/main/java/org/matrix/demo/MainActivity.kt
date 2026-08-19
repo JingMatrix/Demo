@@ -291,6 +291,7 @@ private fun LazyListScope.reportSection(r: JSONObject, label: String, expanded: 
     if (!expanded) return
     item { VerdictCard(r) }
     environmentCard(r)?.let { block -> item { block() } }
+    reconcileCard(r.optJSONObject("reconcile"))?.let { block -> item { block() } }
     markerHitsCard(r.optJSONArray("markerHits"))?.let { block -> item { block() } }
     differentialCard(r.optJSONObject("differential"))?.let { block -> item { block() } }
     fileAccessCard(r)?.let { block -> item { block() } }
@@ -307,12 +308,28 @@ private fun LazyListScope.integritySection(r: JSONObject, expanded: Boolean, onT
     if (!expanded) return
     item { VerdictCard(r) }
     val checks = r.optJSONArray("checks") ?: return
-    if (checks.length() == 0) return
-    item {
+    // Two distinct families: process-integrity (linker solist / memory) vs mount
+    // namespace tampering. Render them as separate groups, injection first.
+    integrityGroupCard(checks, "injection", "Injection detections")?.let { block -> item { block() } }
+    integrityGroupCard(checks, "mount", "Mount traces")?.let { block -> item { block() } }
+    // The detailed reconciliation findings/probes belong to the mount family.
+    reconcileCard(r.optJSONObject("reconcile"))?.let { block -> item { block() } }
+}
+
+// One card for a single detection family (by the check's "type"). Returns null when
+// the report carries no checks of that family.
+private fun integrityGroupCard(checks: JSONArray, type: String, title: String): (@Composable () -> Unit)? {
+    val group = ArrayList<JSONObject>()
+    for (i in 0 until checks.length()) {
+        val c = checks.optJSONObject(i) ?: continue
+        if (c.optString("type") == type) group.add(c)
+    }
+    if (group.isEmpty()) return null
+    val detected = group.count { it.optBoolean("detected") }
+    return {
         StageCard {
-            CardTitle("Checks (${checks.length()})")
-            for (i in 0 until checks.length()) {
-                val c = checks.optJSONObject(i) ?: continue
+            CardTitle("$title  ·  $detected/${group.size} detected")
+            for (c in group) {
                 val det = c.optBoolean("detected")
                 Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
                     Text(
@@ -456,6 +473,63 @@ private fun markerHitsCard(hits: JSONArray?): (@Composable () -> Unit)? {
         StageCard {
             CardTitle("Marker hits (${rows.size})")
             MonoBlock(monoTable(header, rows))
+        }
+    }
+}
+
+// Mount reconciliation: kernel stat ground truth vs mountinfo. The one mount check
+// that survives kernel-side mountinfo filtering (KSU mount_hide et al.).
+private fun reconcileCard(recon: JSONObject?): (@Composable () -> Unit)? {
+    if (recon == null) return null
+    val hidden = recon.optInt("hidden")
+    val structural = recon.optInt("structural")
+    val findings = recon.optJSONArray("findings")
+    return {
+        StageCard {
+            CardTitle("Mount reconciliation — hidden=$hidden structural=$structural")
+            if (findings == null || findings.length() == 0) {
+                Text(
+                    "mountinfo matches kernel stat ground truth (no hidden mounts)",
+                    color = Good,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                val rows = ArrayList<List<String>>(findings.length())
+                for (i in 0 until findings.length()) {
+                    val f = findings.optJSONObject(i) ?: continue
+                    rows.add(
+                        listOf(
+                            f.optString("severity"),
+                            f.optString("path"),
+                            f.optString("detail"),
+                        ),
+                    )
+                }
+                MonoBlock(monoTable(listOf("sev", "path", "detail"), rows))
+            }
+            val probes = recon.optJSONArray("probes")
+            if (probes != null && probes.length() > 0) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "probe outcomes (single-file bind targets)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                val prows = ArrayList<List<String>>(probes.length())
+                for (i in 0 until probes.length()) {
+                    val p = probes.optJSONObject(i) ?: continue
+                    prows.add(
+                        listOf(
+                            p.optString("path"),
+                            if (p.optBoolean("exists")) "y" else "n",
+                            if (p.optBoolean("mountRoot")) "y" else "n",
+                            p.optString("fs"),
+                            if (p.optBoolean("inMountinfo")) "y" else "n",
+                        ),
+                    )
+                }
+                MonoBlock(monoTable(listOf("path", "exist", "mnt", "fs", "in-mi"), prows))
+            }
         }
     }
 }

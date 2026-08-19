@@ -139,23 +139,17 @@ int ParseInt(std::string_view s) {
 std::vector<MountInfo> DetectInjection() {
   std::vector<MountInfo> sus_mount = {};
   auto infos = ParseMountInfo("self");
-  auto root_directory = infos[0];
-  if (root_directory.id != root_directory.parent + 1) {
-    // Caused by multiple calls of unshare
-    sus_mount.emplace_back(root_directory);
-  }
 
-  int consistent_mount_id = root_directory.id;
+  // Root-hiding frameworks leave a fingerprint in a bind mount's source or
+  // root/target path. Mount IDs are NOT a reliable signal: the kernel does not
+  // hand an app's namespace a gap-free, file-order-consecutive block of IDs (nor
+  // a root mount whose ID is parent+1), so the previous ID-arithmetic heuristics
+  // flagged clean devices -- and did so inconsistently between runs on the same
+  // phone. Scan the inherited mounts for genuine root-tool artefacts instead.
   for (auto &info : infos) {
     if (info.target == "/data/data")
-      // Skip mount points specilized for current app
+      // Reached the app-specific mounts; nothing root-owned lives past here.
       break;
-    if (consistent_mount_id != info.id) {
-      sus_mount.emplace_back(info);
-      LOGD("Inconsistent mount ID %i", info.id);
-      break;
-    }
-    consistent_mount_id++;
     if (info.root.starts_with("/adb") ||
         info.target.starts_with("/debug_magisk") || info.source == "magisk" ||
         info.source == "KSU" || info.source == "APatch") {
@@ -165,27 +159,10 @@ std::vector<MountInfo> DetectInjection() {
     }
   }
 
-  std::sort(infos.begin(), infos.end(),
-            [](MountInfo const &a, MountInfo const &b) {
-              return a.optional.master < b.optional.master;
-            });
-
-  int consistent_peer_group = 1;
-  for (auto &info : infos) {
-    LOGD("Checking mount point %i %i %s %s master:%i", info.id, info.parent,
-         info.root.data(), info.target.data(), info.optional.master);
-
-    if (info.root.find("org.matrix.demo") != std::string::npos)
-      // Skip mount points specilized for current app
-      break;
-    if (consistent_peer_group < info.optional.master) {
-      sus_mount.emplace_back(info);
-      LOGD("Mounting peer group %i was unmounted", consistent_peer_group);
-      break;
-    }
-    consistent_peer_group = info.optional.master + 1;
-  }
-
+  // The peer-group consistency check (a gap in the shared:N / master:N id run) now
+  // lives in the shared reconciliation core (Recon::Run, recon.cpp) so it runs
+  // identically in the main process, the native probe, and the classic isolated
+  // probe -- not just here.
   return sus_mount;
 }
 } // namespace Mount
