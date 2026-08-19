@@ -1,6 +1,7 @@
 package org.matrix.demo;
 
 import android.os.Process;
+import android.system.Os;
 import android.util.Log;
 
 import org.json.JSONArray;
@@ -164,7 +165,7 @@ final class ProcScanner {
                         continue;
                     }
                     visible++;
-                    Proc proc = readProc(name);
+                    Proc proc = readProc(name, selfPid);
                     if (proc != null) {
                         procs.add(proc);
                         if (proc.files.get("mountinfo") != null
@@ -227,20 +228,35 @@ final class ProcScanner {
     // ------------------------------------------------------------------
     // per-process read
     // ------------------------------------------------------------------
-    private static Proc readProc(String pid) {
+    private static Proc readProc(String pid, int selfPid) {
         Proc proc = new Proc();
         proc.pid = Integer.parseInt(pid);
-        proc.comm = readTrim("/proc/" + pid + "/comm");
-        proc.cmdline = readCmdline("/proc/" + pid + "/cmdline");
-        proc.uid = readUid("/proc/" + pid + "/status");
+        boolean self = proc.pid == selfPid;
+        // uid is the owner of /proc/<pid> -- one stat, vs reading+parsing status.
+        proc.uid = statUid("/proc/" + pid);
         proc.nsMnt = readNsInode("/proc/" + pid + "/ns/mnt");
 
         for (String file : new String[] {"mountinfo", "mounts", "mountstats"}) {
+            // Only self can ever read mountstats; for every other pid the open is a
+            // guaranteed EACCES and its differential is always a single view. Skip it.
+            if (file.equals("mountstats") && !self) {
+                FileView skipped = new FileView();
+                skipped.error = "skipped(not self)";
+                proc.files.put(file, skipped);
+                continue;
+            }
             FileView v = readMountFile("/proc/" + pid + "/" + file, file);
             proc.files.put(file, v);
         }
         FileView mi = proc.files.get("mountinfo");
-        if (mi != null && mi.readable && !mi.lines.isEmpty()) {
+        boolean miReadable = mi != null && mi.readable && !mi.lines.isEmpty();
+
+        // comm/cmdline are only consumed for pids with a readable mount view (the
+        // marker scan, differential samples, process dump and the per-pid log). For
+        // the hundreds of unreadable pids they are dead reads, so skip them.
+        if (miReadable) {
+            proc.comm = readTrim("/proc/" + pid + "/comm");
+            proc.cmdline = readCmdline("/proc/" + pid + "/cmdline");
             for (String line : mi.lines) {
                 try {
                     MountInfo m = MountInfo.parseLine(line);
@@ -253,32 +269,30 @@ final class ProcScanner {
             }
         }
 
-        // verbose per-pid log
-        StringBuilder fs = new StringBuilder();
-        for (Map.Entry<String, FileView> e : proc.files.entrySet()) {
-            FileView v = e.getValue();
-            fs.append(' ').append(e.getKey()).append('=')
-                    .append(v.readable ? (v.lineCount + "L") : ("X[" + v.error + "]"));
-            if (!v.hits.isEmpty()) {
-                fs.append("!MARK").append(v.hits.size());
-            }
-        }
-        String pidLine = String.format("PID %-6d uid=%-6d ns=%-11d prop=%-9s comm=%-20s%s",
-                proc.pid, proc.uid, proc.nsMnt, blank(proc.propagation), proc.comm, fs);
-        // only readable processes go into the in-app log; the rest stay in logcat only
+        // Only readable processes are interesting; formatting + logging a line for
+        // every one of the (hundreds of) unreadable pids is pure overhead. The
+        // unreadable ones are still counted in the enumeration totals.
         FileView mif = proc.files.get("mountinfo");
         if (mif != null && mif.readable) {
-            plog(pidLine);
-        } else {
-            Log.i(TAG, pidLine);
-        }
+            StringBuilder fs = new StringBuilder();
+            for (Map.Entry<String, FileView> e : proc.files.entrySet()) {
+                FileView v = e.getValue();
+                fs.append(' ').append(e.getKey()).append('=')
+                        .append(v.readable ? (v.lineCount + "L") : ("X[" + v.error + "]"));
+                if (!v.hits.isEmpty()) {
+                    fs.append("!MARK").append(v.hits.size());
+                }
+            }
+            plog(String.format("PID %-6d uid=%-6d ns=%-11d prop=%-9s comm=%-20s%s",
+                    proc.pid, proc.uid, proc.nsMnt, blank(proc.propagation), proc.comm, fs));
 
-        // and dump each marker hit line in full
-        for (Map.Entry<String, FileView> e : proc.files.entrySet()) {
-            FileView v = e.getValue();
-            for (int i = 0; i < v.hitLines.size(); i++) {
-                Log.w(TAG, "  LEAK pid=" + proc.pid + " file=" + e.getKey()
-                        + " :: " + v.hitLines.get(i));
+            // and dump each marker hit line in full
+            for (Map.Entry<String, FileView> e : proc.files.entrySet()) {
+                FileView v = e.getValue();
+                for (int i = 0; i < v.hitLines.size(); i++) {
+                    Log.w(TAG, "  LEAK pid=" + proc.pid + " file=" + e.getKey()
+                            + " :: " + v.hitLines.get(i));
+                }
             }
         }
         return proc;
@@ -454,6 +468,11 @@ final class ProcScanner {
     /** Privisolated differential, run independently for each of the three files. */
     private static JSONObject differentialByFile(List<Proc> procs) throws JSONException {
         JSONObject out = new JSONObject();
+        // pid -> process, so each view-group can name the processes it compares.
+        Map<Integer, Proc> byPid = new LinkedHashMap<>();
+        for (Proc p : procs) {
+            byPid.put(p.pid, p);
+        }
         for (String file : new String[] {"mountinfo", "mounts", "mountstats"}) {
             // group readable pids by their normalized (id-stripped) view
             Map<String, List<Integer>> byView = new LinkedHashMap<>();
@@ -487,10 +506,34 @@ final class ProcScanner {
             JSONArray groups = new JSONArray();
             for (Map.Entry<String, List<Integer>> e : byView.entrySet()) {
                 JSONObject g = new JSONObject();
-                g.put("pidCount", e.getValue().size());
-                g.put("samplePids", new JSONArray(e.getValue().subList(0,
-                        Math.min(6, e.getValue().size()))));
+                List<Integer> pids = e.getValue();
+                g.put("pidCount", pids.size());
                 g.put("lineCount", viewLines.get(e.getKey()).size());
+                g.put("samplePids", new JSONArray(pids.subList(0, Math.min(6, pids.size()))));
+                // Name the processes in this view, and the propagation class(es) they carry,
+                // so the UI shows WHAT is being compared (uid/comm/prop) not just raw pids.
+                JSONArray samples = new JSONArray();
+                for (int pid : pids.subList(0, Math.min(6, pids.size()))) {
+                    Proc p = byPid.get(pid);
+                    JSONObject s = new JSONObject();
+                    s.put("pid", pid);
+                    s.put("comm", p != null ? p.comm : "?");
+                    // Full argv[0] from /proc/pid/cmdline -- the real process identity, unlike
+                    // the kernel's 15-char-truncated comm. Empty for kernel threads.
+                    s.put("cmdline", p != null ? p.cmdline : "");
+                    s.put("uid", p != null ? p.uid : -1);
+                    s.put("prop", p != null ? p.propagation : "");
+                    samples.put(s);
+                }
+                g.put("samples", samples);
+                TreeSet<String> props = new TreeSet<>();
+                for (int pid : pids) {
+                    Proc p = byPid.get(pid);
+                    if (p != null && !p.propagation.isEmpty()) {
+                        props.add(p.propagation);
+                    }
+                }
+                g.put("propagations", new JSONArray(new ArrayList<>(props)));
                 groups.put(g);
             }
             o.put("groups", groups);
@@ -803,10 +846,26 @@ final class ProcScanner {
         entries.addAll(Arrays.asList(SENSITIVE_LINKS));
         entries.addAll(Arrays.asList(SENSITIVE_DIRS));
 
+        // This is a diagnostic (hidepid intact vs AID_READPROC leak), not part of the
+        // verdict. Testing every entry against every pid is ~entries x N open() calls
+        // (tens of thousands). The leak RATIO only needs a representative spread, so
+        // sample up to SAMPLE pids evenly across the (pid-sorted) list.
+        final int SAMPLE = 40;
+        List<Proc> sample;
+        if (procs.size() <= SAMPLE) {
+            sample = procs;
+        } else {
+            sample = new ArrayList<>(SAMPLE);
+            double step = (double) procs.size() / SAMPLE;
+            for (int i = 0; i < SAMPLE; i++) {
+                sample.add(procs.get((int) (i * step)));
+            }
+        }
+
         for (String f : entries) {
             int readable = 0;
             TreeSet<Integer> uids = new TreeSet<>();
-            for (Proc p : procs) {
+            for (Proc p : sample) {
                 String path = "/proc/" + p.pid + "/" + f;
                 boolean ok = links.contains(f) ? canReadlink(path) : dirs.contains(f) ? canList(path) : canRead(path);
                 if (ok) {
@@ -818,11 +877,14 @@ final class ProcScanner {
             }
             JSONObject o = new JSONObject();
             o.put("readable", readable);
-            o.put("tested", procs.size());
+            o.put("tested", sample.size());
+            o.put("sampled", sample.size() < procs.size());
+            o.put("visiblePids", procs.size());
             o.put("readableUids", new JSONArray(new ArrayList<>(uids)));
             out.put(f, o);
         }
-        plog("FILEACCESS-ALL tested " + procs.size() + " visible pids; readable counts:");
+        plog("FILEACCESS-SAMPLE tested " + sample.size() + "/" + procs.size()
+                + " visible pids; readable counts:");
         for (String f : entries) {
             JSONObject o = out.getJSONObject(f);
             plog("  " + f + ": " + o.getInt("readable") + "/" + o.getInt("tested")
@@ -930,16 +992,13 @@ final class ProcScanner {
         return false;
     }
 
-    private static int readUid(String statusPath) {
+    /** Process uid = owner of /proc/<pid>; one stat instead of reading+parsing status. */
+    private static int statUid(String procPath) {
         try {
-            for (String line : Files.readAllLines(Path.of(statusPath))) {
-                if (line.startsWith("Uid:")) {
-                    return Integer.parseInt(line.substring(4).trim().split("\\s+")[0]);
-                }
-            }
-        } catch (Exception ignored) {
+            return Os.stat(procPath).st_uid;
+        } catch (Exception e) {
+            return -1;
         }
-        return -1;
     }
 
     private static long readNsInode(String path) {

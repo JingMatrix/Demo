@@ -569,21 +569,58 @@ private fun differentialCard(diff: JSONObject?): (@Composable () -> Unit)? {
                 val b = d.optJSONArray("diffOnlyInGroupB").toStringList()
                 val hasGroups = groups != null && groups.length() > 0
                 if (!hasGroups && a.isEmpty() && b.isEmpty()) continue
-                SubLabel("$f — class membership & differing lines:")
-                val lines = ArrayList<String>()
+                SubLabel("$f — the processes compared, by mount view:")
                 if (hasGroups) {
                     for (i in 0 until groups!!.length()) {
                         val g = groups.optJSONObject(i) ?: continue
-                        val pids = g.optJSONArray("samplePids").toStringList().joinToString(", ")
-                        lines.add(
-                            "class ${i + 1}: ${g.optInt("pidCount")} pids [$pids] " +
-                                "(${g.optInt("lineCount")} lines)",
+                        val props = g.optJSONArray("propagations").toStringList().joinToString(", ")
+                        val pidCount = g.optInt("pidCount")
+                        Text(
+                            "view ${i + 1}  ·  $pidCount process(es)  ·  ${if (props.isEmpty()) "?" else props}  ·  ${g.optInt("lineCount")} lines",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
                         )
+                        val samples = g.optJSONArray("samples")
+                        val rows = ArrayList<List<String>>()
+                        if (samples != null) {
+                            for (j in 0 until samples.length()) {
+                                val s = samples.optJSONObject(j) ?: continue
+                                // Prefer the full cmdline; fall back to the truncated comm
+                                // (in brackets) only when cmdline is empty (kernel threads).
+                                val cmdline = s.optString("cmdline")
+                                val name = if (cmdline.isNotEmpty()) cmdline else "[" + s.optString("comm") + "]"
+                                rows.add(
+                                    listOf(
+                                        s.optInt("pid").toString(),
+                                        "u:" + s.optInt("uid"),
+                                        s.optString("prop"),
+                                        name,
+                                    ),
+                                )
+                            }
+                        }
+                        if (rows.isNotEmpty()) {
+                            // The process column is last and can be long; MonoBlock scrolls
+                            // horizontally (tap to wrap) so nothing is cut.
+                            MonoBlock(monoTable(listOf("pid", "uid", "prop", "process"), rows))
+                        }
+                        if (pidCount > rows.size) {
+                            Text(
+                                "  +${pidCount - rows.size} more with this view",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
-                a.forEach { lines.add("only in group A: $it") }
-                b.forEach { lines.add("only in group B: $it") }
-                MonoBlock(lines)
+                if (a.isNotEmpty() || b.isNotEmpty()) {
+                    SubLabel("records that differ (A = largest view, B = 2nd largest):")
+                    val lines = ArrayList<String>()
+                    a.forEach { lines.add("A only: $it") }
+                    b.forEach { lines.add("B only: $it") }
+                    MonoBlock(lines)
+                }
             }
         }
     }
@@ -803,8 +840,12 @@ private fun processesCards(procs: JSONArray?, scope: LazyListScope) {
 
 @Composable
 private fun ProcessCard(p: JSONObject) {
-    val header = "pid ${p.optString("pid")} ${p.optString("comm")}  " +
-        "uid=${p.optString("uid")} ns=${p.optString("nsMnt")} prop=${p.optString("propagation")}"
+    // Prefer the full cmdline over the kernel's 15-char comm; the ExpandableCard
+    // header shows it in full when expanded.
+    val cmdline = p.optString("cmdline")
+    val name = if (cmdline.isNotEmpty()) cmdline else p.optString("comm")
+    val header = "pid ${p.optString("pid")}  uid=${p.optString("uid")} " +
+        "ns=${p.optString("nsMnt")} prop=${p.optString("propagation")}\n$name"
     ExpandableCard(header) {
         val files = p.optJSONObject("files")
         if (files == null) {
