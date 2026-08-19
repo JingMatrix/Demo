@@ -536,34 +536,33 @@ private fun reconcileCard(recon: JSONObject?): (@Composable () -> Unit)? {
 
 private fun differentialCard(diff: JSONObject?): (@Composable () -> Unit)? {
     if (diff == null) return null
-    val files = listOf("mountinfo", "mounts", "mountstats")
+    // mountinfo is the richest and is what Privisolated itself reads; mounts/mountstats
+    // describe the same mounts, so showing one file is enough (the verdict still weighs all
+    // three under the hood, in case a filter patches only one of them).
+    val files = listOf("mountinfo")
     if (files.none { diff.optJSONObject(it) != null }) return null
     return {
         StageCard {
             CardTitle("Differential (distinct views vs propagation classes)")
             Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-                Cell("file", 0.34f, header = true)
-                Cell("views", 0.18f, header = true)
-                Cell("classes", 0.24f, header = true)
-                Cell("result", 0.24f, header = true)
+                Cell("file", 0.28f, header = true)
+                Cell("views", 0.16f, header = true)
+                Cell("classes", 0.20f, header = true)
+                Cell("result", 0.36f, header = true)
             }
             for (f in files) {
                 val d = diff.optJSONObject(f) ?: continue
-                val mismatch = d.optBoolean("mismatch")
-                val benign = d.optBoolean("benignDifference")
-                val raw = d.optInt("distinctViews")
-                val interp = d.optInt("interpretedViews")
+                val rawMismatch = d.optBoolean("rawMismatch")
                 Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-                    Cell(f, 0.34f)
-                    // Raw view count is the truth; show the interpreted count too when they
-                    // differ (benign per-process mounts collapsed some views).
-                    Cell(if (interp != raw) "$raw→$interp" else "$raw", 0.18f)
-                    Cell(d.optInt("propagationClasses").toString(), 0.24f)
+                    Cell(f, 0.28f)
+                    // The raw distinct-view count IS the verdict input; the interpreted count is
+                    // no longer shown, it was a display heuristic that masked this exact signal.
+                    Cell(d.optInt("distinctViews").toString(), 0.16f)
+                    Cell(d.optInt("propagationClasses").toString(), 0.20f)
                     Cell(
-                        if (mismatch) "MISMATCH" else if (benign) "benign" else "ok",
-                        0.24f,
-                        color = if (mismatch) MaterialTheme.colorScheme.error
-                        else if (benign) MaterialTheme.colorScheme.tertiary
+                        if (rawMismatch) "INCONSISTENT" else "consistent",
+                        0.36f,
+                        color = if (rawMismatch) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -577,14 +576,22 @@ private fun differentialCard(diff: JSONObject?): (@Composable () -> Unit)? {
                 val bLen = b?.length() ?: 0
                 val hasGroups = groups != null && groups.length() > 0
                 if (!hasGroups && aLen == 0 && bLen == 0) continue
+                fun pidSet(key: String): Set<Int> =
+                    d.optJSONArray(key)?.let { arr -> (0 until arr.length()).map { arr.optInt(it) }.toSet() }
+                        ?: emptySet()
+                val pidsA = pidSet("diffPidsA")
+                val pidsB = pidSet("diffPidsB")
                 SubLabel("$f — the processes compared, by mount view:")
                 if (hasGroups) {
                     for (i in 0 until groups!!.length()) {
                         val g = groups.optJSONObject(i) ?: continue
                         val props = g.optJSONArray("propagations").toStringList().joinToString(", ")
                         val pidCount = g.optInt("pidCount")
+                        val gp = g.optJSONArray("samplePids")
+                        val fp = if (gp != null && gp.length() > 0) gp.optInt(0) else -1
+                        val ab = if (fp in pidsA) " (A)" else if (fp in pidsB) " (B)" else ""
                         Text(
-                            "view ${i + 1}  ·  $pidCount process(es)  ·  ${if (props.isEmpty()) "?" else props}  ·  ${g.optInt("lineCount")} lines",
+                            "view ${i + 1}$ab  ·  $pidCount process(es)  ·  ${if (props.isEmpty()) "?" else props}  ·  ${g.optInt("lineCount")} lines",
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 12.sp,
                             modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
@@ -623,17 +630,15 @@ private fun differentialCard(diff: JSONObject?): (@Composable () -> Unit)? {
                     }
                 }
                 if (aLen > 0 || bLen > 0) {
-                    val allBenign = d.optBoolean("benignDifference")
-                    SubLabel(
-                        "records that differ (A = largest view, B = 2nd largest)" +
-                            if (allBenign) " — all benign per-process mounts, treated as consistent:" else ":",
-                    )
+                    SubLabel("records that differ (A / B are the views tagged above):")
                     val lines = ArrayList<String>()
                     fun addDiff(arr: JSONArray?, tag: String) {
                         if (arr == null) return
                         for (i in 0 until arr.length()) {
                             val o = arr.optJSONObject(i) ?: continue
-                            val mark = if (o.optBoolean("benign")) "[benign]" else "[ LEAK ]"
+                            // The tag describes the record SHAPE only; when views diverge within one
+                            // class, every differing record is part of the artifact regardless.
+                            val mark = if (o.optBoolean("benign")) "[storage/data]" else "[    other   ]"
                             lines.add("$tag $mark ${o.optString("line")}")
                         }
                     }
