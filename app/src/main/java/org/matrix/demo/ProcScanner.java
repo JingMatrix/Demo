@@ -121,8 +121,9 @@ final class ProcScanner {
         String error = "";
         int lineCount;
         List<String> lines = Collections.emptyList();  // raw
-        String normalized = "";                         // sorted normalized keys, for view-equality
-        List<String> normalizedLines = Collections.emptyList();  // Privisolated-style keys
+        String normalized = "";                         // RAW sorted normalized keys, for view-equality
+        String normalizedInterpreted = "";              // same, minus benign per-process mounts (verdict only)
+        List<String> normalizedLines = Collections.emptyList();  // RAW Privisolated-style keys (for display)
         final List<Markers.Hit> hits = new ArrayList<>();
         final List<String> hitLines = new ArrayList<>();
     }
@@ -315,23 +316,27 @@ final class ProcScanner {
             // superOptions and deliberately omits the mount id, parent id, and the optional
             // (shared:N / master:N) field. Those differ between ANY two separately-unshared
             // namespaces, so comparing raw lines invents differences that no probe sees.
-            List<String> keys = new ArrayList<>(lines.size());
+            // RAW keys keep EVERY mount -- that is the true view the UI must show. The
+            // INTERPRETED keys additionally drop the mounts Android customises per process
+            // (app-data isolation tmpfs, the external-storage subsystem): a WebView
+            // sandboxed process legitimately lacks the storage view a permitted app has, so
+            // two processes in the same propagation class differ by exactly these. Whether
+            // that difference is benign is OUR call, so it drives only the verdict -- never
+            // the raw distinctViews shown to the user.
+            List<String> rawKeys = new ArrayList<>(lines.size());
+            List<String> interpretedKeys = new ArrayList<>(lines.size());
             for (String l : lines) {
-                if (isDataIsolationMount(l, kind)) {
-                    // Android's per-process app-data isolation (Android 11+) mounts a bare
-                    // tmpfs over the data dirs a process must not see. Which dirs get covered
-                    // depends on the process's uid/type, so two processes in the SAME
-                    // propagation class legitimately differ by exactly these mounts. Leaving
-                    // them in inflates distinctViews past propagationClasses and fires the
-                    // Privisolated differential on stock. They are not part of the view that
-                    // propagation governs, so drop them before keying.
-                    continue;
+                String key = normalizeKey(l, kind);
+                rawKeys.add(key);
+                if (!isPerProcessBenignMount(l, kind)) {
+                    interpretedKeys.add(key);
                 }
-                keys.add(normalizeKey(l, kind));
             }
-            Collections.sort(keys);
-            v.normalizedLines = keys;
-            v.normalized = String.join("\n", keys);
+            Collections.sort(rawKeys);
+            Collections.sort(interpretedKeys);
+            v.normalizedLines = rawKeys;
+            v.normalized = String.join("\n", rawKeys);
+            v.normalizedInterpreted = String.join("\n", interpretedKeys);
 
             for (String l : lines) {
                 List<Markers.Hit> hits;
@@ -383,6 +388,8 @@ final class ProcScanner {
 
     /** Data dirs that Android covers with a per-process isolation tmpfs. Prefix-matched, so
      *  "/data/user" also covers "/data/user_de" and "/data/user/<n>". */
+    // A bare tmpfs the platform stacks over a per-app / per-user data dir to blind a
+    // process to data it may not read. Which dirs are covered depends on the process.
     private static final String[] DATA_ISOLATION_POINTS = {
         "/data/data",
         "/data/user",
@@ -394,14 +401,29 @@ final class ProcScanner {
         "/data/misc_de",
     };
 
+    // The external-storage subsystem. AOSP grafts these per-process based on the
+    // process's storage grants / sandbox status (a WebView sandboxed process gets
+    // none; a storage-permitted app gets the FUSE + tmpfs storage view), so two
+    // processes in the SAME propagation class legitimately differ by exactly these.
+    // Matched regardless of fs type (tmpfs / fuse / sdcardfs).
+    private static final String[] STORAGE_POINTS = {
+        "/storage",
+        "/mnt/user",
+        "/mnt/androidwritable",
+        "/mnt/pass_through",
+        "/mnt/installer",
+        "/mnt/runtime",
+    };
+
     /**
-     * True for a benign app-data-isolation mount: a bare {@code tmpfs} the platform stacks
-     * over a per-app / per-user data dir to blind a process to data it may not read. Keyed
-     * narrowly (type must be tmpfs) so a module's bind/overlay over the same path -- which
-     * carries a real source and a non-"/" root -- is NOT swallowed and still diverges views.
+     * True for a benign per-process mount the platform customises per process -- app-data
+     * isolation tmpfs, or the external-storage subsystem -- so it does not count as a view
+     * divergence in the Privisolated differential. Data-isolation is keyed narrowly (type
+     * must be tmpfs) so a module's bind/overlay over a data path still diverges views; the
+     * storage subsystem is keyed by mountpoint alone (its fs type varies: tmpfs/fuse).
      * mountstats has no per-line type field and stays untouched.
      */
-    private static boolean isDataIsolationMount(String line, String kind) {
+    private static boolean isPerProcessBenignMount(String line, String kind) {
         String point;
         String type;
         if (kind.equals("mountinfo")) {
@@ -422,15 +444,52 @@ final class ProcScanner {
         } else {
             return false;
         }
-        if (!"tmpfs".equals(type)) {
-            return false;
-        }
-        for (String prefix : DATA_ISOLATION_POINTS) {
+        return isBenignPoint(point, type);
+    }
+
+    /** Core predicate: is a mount at (point, type) one Android customises per process? */
+    private static boolean isBenignPoint(String point, String type) {
+        for (String prefix : STORAGE_POINTS) {
             if (point.equals(prefix) || point.startsWith(prefix + "/")) {
                 return true;
             }
         }
+        if ("tmpfs".equals(type)) {
+            for (String prefix : DATA_ISOLATION_POINTS) {
+                if (point.equals(prefix) || point.startsWith(prefix + "/")) {
+                    return true;
+                }
+            }
+        }
         return false;
+    }
+
+    /**
+     * Same predicate applied to a normalized differential KEY (what the diff lines are), so
+     * the UI can tag each differing record benign. mountinfo key = "source root point type
+     * options superopts"; mounts key = "source point type options".
+     */
+    private static boolean isBenignKey(String key, String kind) {
+        String[] t = key.split(" ");
+        if (kind.equals("mountinfo") && t.length >= 4) {
+            return isBenignPoint(t[2], t[3]);
+        }
+        if (kind.equals("mounts") && t.length >= 3) {
+            return isBenignPoint(t[1], t[2]);
+        }
+        return false;
+    }
+
+    /** Wrap each differing record as {line, benign} so the UI shows the raw diff + our read. */
+    private static JSONArray tagDiff(java.util.Collection<String> lines, String kind) throws JSONException {
+        JSONArray arr = new JSONArray();
+        for (String l : lines) {
+            JSONObject o = new JSONObject();
+            o.put("line", l);
+            o.put("benign", isBenignKey(l, kind));
+            arr.put(o);
+        }
+        return arr;
     }
 
     // ------------------------------------------------------------------
@@ -474,9 +533,13 @@ final class ProcScanner {
             byPid.put(p.pid, p);
         }
         for (String file : new String[] {"mountinfo", "mounts", "mountstats"}) {
-            // group readable pids by their normalized (id-stripped) view
+            // Group readable pids by their RAW id-stripped view (every mount kept) -- this
+            // is the true, uninterpreted picture the UI renders. Separately count the
+            // INTERPRETED views (benign per-process mounts removed); their collapse vs the
+            // propagation classes is what the verdict keys on.
             Map<String, List<Integer>> byView = new LinkedHashMap<>();
             Map<String, List<String>> viewLines = new LinkedHashMap<>();
+            java.util.Set<String> interpretedViews = new java.util.HashSet<>();
             int classesMask = 0;
             for (Proc p : procs) {
                 FileView v = p.files.get(file);
@@ -485,6 +548,7 @@ final class ProcScanner {
                 }
                 byView.computeIfAbsent(v.normalized, k -> new ArrayList<>()).add(p.pid);
                 viewLines.putIfAbsent(v.normalized, v.normalizedLines);
+                interpretedViews.add(v.normalizedInterpreted);
                 if (p.propagation.startsWith("shared")) {
                     classesMask |= 1;
                 } else if (p.propagation.startsWith("master")) {
@@ -492,17 +556,22 @@ final class ProcScanner {
                 }
             }
             int distinct = byView.size();
+            int interpreted = interpretedViews.size();
             int classes = Integer.bitCount(classesMask);
             // Injection can only ADD a per-process view, so the signal is strictly more
-            // views than propagation classes justify. distinct < classes just means two
-            // classes happen to share identical content (common once benign per-process
-            // isolation mounts are normalized out) and is not evidence of tampering.
-            boolean mismatch = distinct > classes;
+            // views than propagation classes justify -- measured AFTER removing the mounts
+            // Android varies per process. A raw distinct > classes that collapses once those
+            // are removed is a benign per-process difference (storage/data isolation), not a
+            // tamper. distinct < classes just means two classes share identical content.
+            boolean mismatch = interpreted > classes;
+            boolean benignDifference = distinct > classes && interpreted <= classes;
 
             JSONObject o = new JSONObject();
             o.put("distinctViews", distinct);
+            o.put("interpretedViews", interpreted);
             o.put("propagationClasses", classes);
             o.put("mismatch", mismatch);
+            o.put("benignDifference", benignDifference);
             JSONArray groups = new JSONArray();
             for (Map.Entry<String, List<Integer>> e : byView.entrySet()) {
                 JSONObject g = new JSONObject();
@@ -538,8 +607,10 @@ final class ProcScanner {
             }
             o.put("groups", groups);
             plog("DIFFERENTIAL[" + file + "] distinctViews=" + distinct
-                    + " propagationClasses=" + classes + " => "
-                    + (mismatch ? "MISMATCH (Privisolated fires)" : "consistent"));
+                    + " interpreted=" + interpreted + " propagationClasses=" + classes + " => "
+                    + (mismatch ? "MISMATCH (Privisolated fires)"
+                            : benignDifference ? "raw differs, benign per-process (storage/data)"
+                            : "consistent"));
 
             // When >1 distinct view, log the exact normalized lines that differ between the
             // two largest groups -- this is the precise leak Privisolated keys on.
@@ -552,10 +623,10 @@ final class ProcScanner {
                 b.forEach(onlyA::remove);
                 TreeSet<String> onlyB = new TreeSet<>(b);
                 a.forEach(onlyB::remove);
-                JSONArray da = new JSONArray(new ArrayList<>(onlyA));
-                JSONArray db = new JSONArray(new ArrayList<>(onlyB));
-                o.put("diffOnlyInGroupA", da);
-                o.put("diffOnlyInGroupB", db);
+                // Each differing record is tagged benign (a per-process mount we discount)
+                // or not, so the UI shows the raw difference AND our reading of it.
+                o.put("diffOnlyInGroupA", tagDiff(onlyA, file));
+                o.put("diffOnlyInGroupB", tagDiff(onlyB, file));
                 pwarn("DIFFERENTIAL[" + file + "] groupA(pids " + big.get(0).getValue()
                         + ") vs groupB(pids " + big.get(1).getValue() + "):");
                 for (String l : onlyA) {
@@ -746,9 +817,10 @@ final class ProcScanner {
             for (String f : new String[] {"mountinfo", "mounts", "mountstats"}) {
                 JSONObject d = diff.optJSONObject(f);
                 if (d != null && d.optBoolean("mismatch")) {
-                    reasons.add("differential mismatch in " + f + " (distinctViews="
-                            + d.optInt("distinctViews") + " > classes="
-                            + d.optInt("propagationClasses") + ")");
+                    reasons.add("differential mismatch in " + f + " (views="
+                            + d.optInt("interpretedViews") + " > classes="
+                            + d.optInt("propagationClasses")
+                            + ", after discounting benign per-process mounts)");
                 }
             }
         }

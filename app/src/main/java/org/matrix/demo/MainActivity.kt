@@ -550,14 +550,20 @@ private fun differentialCard(diff: JSONObject?): (@Composable () -> Unit)? {
             for (f in files) {
                 val d = diff.optJSONObject(f) ?: continue
                 val mismatch = d.optBoolean("mismatch")
+                val benign = d.optBoolean("benignDifference")
+                val raw = d.optInt("distinctViews")
+                val interp = d.optInt("interpretedViews")
                 Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
                     Cell(f, 0.34f)
-                    Cell(d.optInt("distinctViews").toString(), 0.18f)
+                    // Raw view count is the truth; show the interpreted count too when they
+                    // differ (benign per-process mounts collapsed some views).
+                    Cell(if (interp != raw) "$raw→$interp" else "$raw", 0.18f)
                     Cell(d.optInt("propagationClasses").toString(), 0.24f)
                     Cell(
-                        if (mismatch) "MISMATCH" else "ok",
+                        if (mismatch) "MISMATCH" else if (benign) "benign" else "ok",
                         0.24f,
                         color = if (mismatch) MaterialTheme.colorScheme.error
+                        else if (benign) MaterialTheme.colorScheme.tertiary
                         else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -565,10 +571,12 @@ private fun differentialCard(diff: JSONObject?): (@Composable () -> Unit)? {
             for (f in files) {
                 val d = diff.optJSONObject(f) ?: continue
                 val groups = d.optJSONArray("groups")
-                val a = d.optJSONArray("diffOnlyInGroupA").toStringList()
-                val b = d.optJSONArray("diffOnlyInGroupB").toStringList()
+                val a = d.optJSONArray("diffOnlyInGroupA")
+                val b = d.optJSONArray("diffOnlyInGroupB")
+                val aLen = a?.length() ?: 0
+                val bLen = b?.length() ?: 0
                 val hasGroups = groups != null && groups.length() > 0
-                if (!hasGroups && a.isEmpty() && b.isEmpty()) continue
+                if (!hasGroups && aLen == 0 && bLen == 0) continue
                 SubLabel("$f — the processes compared, by mount view:")
                 if (hasGroups) {
                     for (i in 0 until groups!!.length()) {
@@ -614,11 +622,23 @@ private fun differentialCard(diff: JSONObject?): (@Composable () -> Unit)? {
                         }
                     }
                 }
-                if (a.isNotEmpty() || b.isNotEmpty()) {
-                    SubLabel("records that differ (A = largest view, B = 2nd largest):")
+                if (aLen > 0 || bLen > 0) {
+                    val allBenign = d.optBoolean("benignDifference")
+                    SubLabel(
+                        "records that differ (A = largest view, B = 2nd largest)" +
+                            if (allBenign) " — all benign per-process mounts, treated as consistent:" else ":",
+                    )
                     val lines = ArrayList<String>()
-                    a.forEach { lines.add("A only: $it") }
-                    b.forEach { lines.add("B only: $it") }
+                    fun addDiff(arr: JSONArray?, tag: String) {
+                        if (arr == null) return
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val mark = if (o.optBoolean("benign")) "[benign]" else "[ LEAK ]"
+                            lines.add("$tag $mark ${o.optString("line")}")
+                        }
+                    }
+                    addDiff(a, "A only:")
+                    addDiff(b, "B only:")
                     MonoBlock(lines)
                 }
             }
