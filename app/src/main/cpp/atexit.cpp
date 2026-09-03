@@ -1,14 +1,11 @@
 #include "atexit.hpp"
 
-#include "elf_util.h"
+#include "elf_parser.hpp"
 #include "logging.h"
 
 template <typename T>
-inline T *getExportedFieldPointer(const SandHook::ElfImg &libc,
-                                  const char *name) {
-  auto *addr = reinterpret_cast<T *>(libc.getSymbAddress(name));
-
-  return addr == nullptr ? nullptr : addr;
+inline T *getExportedFieldPointer(const ElfParser::ElfImage &libc, const char *name) {
+  return ElfParser::findDirectSymbol<T>(libc, name);
 }
 
 namespace Atexit {
@@ -148,7 +145,7 @@ bool AtexitArray::expand_capacity() {
 }
 
 AtexitArray *findAtexitArray() {
-  SandHook::ElfImg libc("libc.so");
+  ElfParser::ElfImage libc("libc.so");
   auto p_array = getExportedFieldPointer<AtexitEntry *>(libc, "_ZL7g_array.0");
   auto p_size = getExportedFieldPointer<size_t>(libc, "_ZL7g_array.1");
   auto p_extracted_count =

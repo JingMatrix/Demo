@@ -1,5 +1,11 @@
+#pragma once
+
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <sys/types.h>
+#include <vector>
+
 namespace VirtualMap {
 
 struct MapInfo {
@@ -33,7 +39,11 @@ struct MapInfo {
   Scan();
 };
 
-MapInfo *DetectInjection();
+// By value: this used to return a pointer into the temporary MapInfo::Scan() returns,
+// so every caller read freed memory and the detail came out empty.
+std::optional<MapInfo> DetectInjection();
+
+std::string Describe(const MapInfo &info);
 
 void DumpStackStrings();
 } // namespace VirtualMap

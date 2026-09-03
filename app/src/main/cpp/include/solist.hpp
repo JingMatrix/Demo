@@ -1,105 +1,79 @@
 #pragma once
 
-#include "elf_util.h"
+// Read-only walk of the linker's soinfo list. Offsets come from a real AOSP struct
+// soinfo and are re-derived at runtime. No ProtectedDataGuard: a detector never writes,
+// and requiring that symbol is what made this fail outright on Android 17.
+
 #include <string>
+#include <vector>
+
+#include "elf_parser.hpp"
+#include "linker_soinfo.h"
 
 namespace SoList {
+
 class SoInfo {
 public:
-#ifdef __LP64__
-  inline static size_t solist_next_offset = 0x28;
-  inline static size_t solist_realpath_offset = 0x1a0;
-#else
-  inline static size_t solist_next_offset = 0xa4;
-  inline static size_t solist_realpath_offset = 0x17c;
-#endif
+  inline static size_t solist_size_offset = soinfo::get_size_offset();
+  inline static size_t solist_next_offset = soinfo::get_next_offset();
+  inline static size_t solist_constructors_called_offset =
+      soinfo::get_constructors_called_offset();
+  inline static size_t solist_realpath_offset = soinfo::get_realpath_offset();
 
-  inline static const char *(*get_realpath_sym)(SoInfo *) = NULL;
+  inline static const char *(*get_realpath_sym)(SoInfo *) = nullptr;
+  inline static const char *(*get_soname_sym)(SoInfo *) = nullptr;
 
-  inline SoInfo *get_next() {
-    return *(SoInfo **)((uintptr_t)this + solist_next_offset);
+  // Set only once the heuristic has matched the linker's own realpath at that offset.
+  // Until then the compile-time value is a guess, and dereferencing it as a std::string
+  // means calling c_str() on whatever soinfo word happens to sit there.
+  inline static bool realpath_offset_confirmed = false;
+
+  inline size_t get_size() const {
+    return *reinterpret_cast<const size_t *>((uintptr_t)this + solist_size_offset);
+  }
+
+  inline SoInfo *get_next() const {
+    return *reinterpret_cast<SoInfo *const *>((uintptr_t)this + solist_next_offset);
+  }
+
+  inline bool get_constructor_called() const {
+    return *reinterpret_cast<const bool *>((uintptr_t)this +
+                                           solist_constructors_called_offset);
   }
 
   inline const char *get_path() {
-    if (get_realpath_sym)
-      return get_realpath_sym(this);
-
-    return ((std::string *)((uintptr_t)this + solist_realpath_offset))->c_str();
+    if (get_realpath_sym) return get_realpath_sym(this);
+    if (!realpath_offset_confirmed) return nullptr;
+    return reinterpret_cast<std::string *>((uintptr_t)this + solist_realpath_offset)->c_str();
   }
 
+  // soname_ sits directly before realpath_ in soinfo, so the confirmed realpath offset
+  // locates it -- but only that offset does.
   inline const char *get_name() {
-    return ((std::string *)((uintptr_t)this + solist_realpath_offset -
-                            sizeof(std::string)))
+    if (get_soname_sym) return get_soname_sym(this);
+    if (!realpath_offset_confirmed) return nullptr;
+    return reinterpret_cast<std::string *>((uintptr_t)this + solist_realpath_offset -
+                                           sizeof(std::string))
         ->c_str();
   }
-
-  void set_next(SoInfo *si) {
-    *(SoInfo **)((uintptr_t)this + solist_next_offset) = si;
-  }
 };
 
-class ProtectedDataGuard {
-public:
-  ProtectedDataGuard() {
-    if (ctor != nullptr)
-      (this->*ctor)();
-  }
-
-  ~ProtectedDataGuard() {
-    if (dtor != nullptr)
-      (this->*dtor)();
-  }
-
-  static bool setup(const SandHook::ElfImg &linker) {
-    ctor = MemFunc{.data = {.p = reinterpret_cast<void *>(linker.getSymbAddress(
-                                "__dl__ZN18ProtectedDataGuardC2Ev")),
-                            .adj = 0}}
-               .f;
-    dtor = MemFunc{.data = {.p = reinterpret_cast<void *>(linker.getSymbAddress(
-                                "__dl__ZN18ProtectedDataGuardD2Ev")),
-                            .adj = 0}}
-               .f;
-    return ctor != nullptr && dtor != nullptr;
-  }
-
-  ProtectedDataGuard(const ProtectedDataGuard &) = delete;
-
-  void operator=(const ProtectedDataGuard &) = delete;
-
-private:
-  using FuncType = void (ProtectedDataGuard::*)();
-
-  static FuncType ctor;
-  static FuncType dtor;
-
-  union MemFunc {
-    FuncType f;
-
-    struct {
-      void *p;
-      std::ptrdiff_t adj;
-    } data;
-  };
+struct Finding {
+  SoInfo *info;
+  std::string reason;
 };
 
-static SoInfo *solinker = NULL;
-static SoInfo *somain = NULL;
-static SoInfo **sonext = NULL;
-static uint64_t *g_module_unload_counter = NULL;
-
-static bool Initialize();
-
-template <typename T>
-inline T *getStaticPointer(const SandHook::ElfImg &linker, const char *name) {
-  auto *addr = reinterpret_cast<T **>(linker.getSymbAddress(name));
-
-  return addr == NULL ? NULL : *addr;
-}
+// Idempotent. Needs the list head and some way to read a realpath -- the symbol, or an
+// offset the heuristic confirmed; without one every finding would be built by casting
+// an unverified soinfo word to std::string. Every other symbol is optional, so a build
+// that hides one weakens the walk instead of disabling it.
+bool Initialize();
 
 SoInfo *DetectInjection();
-size_t DetectModules();
-bool findHeuristicOffsets(std::string linker_name);
 
-bool Initialize();
+std::vector<Finding> DetectAll();
+
+// Informational only; dlphdr.cpp is what turns this number into a verdict.
+size_t DetectModules();
 
 } // namespace SoList

@@ -61,7 +61,14 @@ void DumpStackStrings() {
   }
 }
 
-MapInfo *DetectInjection() {
+// Test the shape, not the name: ART's code caches live in anonymous memory too.
+static bool starts_with_elf(const MapInfo &info) {
+  if (!(info.perms & PROT_READ))
+    return true; // cannot look; stay suspicious
+  return memcmp(reinterpret_cast<const void *>(info.start), "\177ELF", 4) == 0;
+}
+
+std::optional<MapInfo> DetectInjection() {
   int jit_cache_count = 0;
   int jit_zygote_cache_count = 0;
 
@@ -72,13 +79,18 @@ MapInfo *DetectInjection() {
         continue;
 
       if (!info.path.starts_with("/")) {
-        LOGI("Executable block with path %s", info.path.data());
-        return &info;
+        if (!starts_with_elf(info)) {
+          LOGD("Non-ELF executable block %s, not an injected library",
+               info.path.empty() ? "<anonymous>" : info.path.data());
+          continue;
+        }
+        LOGI("Executable ELF image with path %s", info.path.data());
+        return info;
       }
 
       if (info.path.starts_with("/dev/zero")) {
         LOGI("Shared anonymous executable block found");
-        return &info;
+        return info;
       }
 
       if (info.path.starts_with("/memfd:jit-cache")) {
@@ -91,18 +103,32 @@ MapInfo *DetectInjection() {
         if (stat(info.path.data(), &sb_buf) != 0 ||
             sb_buf.st_ino != info.inode) {
           LOGI("Executable block with inconsistent inode %s", info.path.data());
-          return &info;
+          return info;
         }
       }
 
       if (jit_cache_count > 1 || jit_zygote_cache_count > 1) {
         LOGI("Futile renaming to jit blocks");
-        return &info;
+        return info;
       }
     }
   }
 
-  return nullptr;
+  return std::nullopt;
+}
+
+std::string Describe(const MapInfo &info) {
+  char buf[320];
+  bool elf = (info.perms & PROT_READ) &&
+             memcmp(reinterpret_cast<const void *>(info.start), "\177ELF", 4) == 0;
+  snprintf(buf, sizeof(buf), "%zx-%zx %c%c%c%c %u:%u ino %lu %zu bytes %s%s",
+           (size_t)info.start, (size_t)info.end, (info.perms & PROT_READ) ? 'r' : '-',
+           (info.perms & PROT_WRITE) ? 'w' : '-', (info.perms & PROT_EXEC) ? 'x' : '-',
+           info.is_private ? 'p' : 's', major(info.dev), minor(info.dev),
+           (unsigned long)info.inode, (size_t)(info.end - info.start),
+           info.path.empty() ? "<anonymous>" : info.path.c_str(),
+           elf ? " [ELF image]" : "");
+  return buf;
 }
 
 std::vector<MapInfo> MapInfo::Scan() {
