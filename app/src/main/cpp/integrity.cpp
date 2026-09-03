@@ -66,8 +66,15 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
     // 1. injected shared library, found by walking the linker's solist. This is the
     //    only check that can name the library: it reads the soname and realpath the
     //    linker itself recorded, which /proc/self/maps does not carry.
-    std::vector<SoList::Finding> sos = SoList::DetectAll();
-    if (!sos.empty()) {
+    // A walk that could not start is not a clean walk. Reporting the two apart matters:
+    // this detector was silently failing open on Android 17 for months.
+    bool solist_ready = SoList::Initialize();
+    std::vector<SoList::Finding> sos = solist_ready ? SoList::DetectAll() : std::vector<SoList::Finding>();
+    if (!solist_ready) {
+        add(arr, first, "injection", "Solist injection", false,
+            "unavailable: the linker's object list could not be located on this build "
+            "(this is not a clean result)");
+    } else if (!sos.empty()) {
         any = true;
         std::string d = sos.front().info->get_name();
         if (d.empty())
@@ -157,9 +164,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
                              std::to_string(dp.phdrMismatch) + " phdr mismatch(es), " +
                              std::to_string(dp.badName) + " bad name(s)"
                        : "no private anonymous executable memory outside the linker's objects") +
-            "; " + std::to_string(dp.foreignExec) +
-            " executable mapping(s) outside them are file-backed or shared, which is what "
-            "the runtime's oat files and code caches look like");
+            "; " + std::to_string(dp.volatileExec) +
+            " executable mapping(s) on no real device (anonymous, shmem or memfd -- ART's two "
+            "code caches live here and cannot be told apart by any key a process cannot forge), " +
+            std::to_string(dp.foreignExec) + " on a real device the linker did not load");
 
     // 5. whether this sandbox even permits executable memory the linker never saw.
     //    Informational: it is what decides how much the check above proves.

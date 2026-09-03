@@ -101,17 +101,18 @@
 //              headers that disagree with the ELF header actually mapped there.
 //              This is a whitelist of pages the linker vouches for, so unlike
 //              vmap.cpp's blacklist it cannot be dodged by renaming a mapping.
-//              What separates an injected library from the runtime's own executable
-//              memory is deliberately never its NAME: prctl(PR_SET_VMA_ANON_NAME) lets
-//              any process label its anonymous memory "dalvik-jit-code-cache" and clear
-//              the label again afterwards, so a name proves nothing. The two facts the
-//              process cannot forge about itself are whether a mapping is backed by a
-//              file and whether it is shared. ART's code caches are MAP_SHARED views of
-//              a memfd and its compiled code lives in file-backed oat/odex; a library
-//              the linker loaded is MAP_PRIVATE and file-backed. That leaves exactly one
-//              shape unaccounted for -- private, anonymous and executable -- and on the
-//              devices measured here a real app process contains none of it at all:
-//              380 executable mappings, every one file-backed but [vdso].
+//              Almost everything about a mapping is chosen by whoever created it, and
+//              is therefore worthless as evidence: prctl(PR_SET_VMA_ANON_NAME) sets the
+//              name and clears it again, memfd_create supplies a pathname, MAP_SHARED is
+//              an argument, and manually mapped code need not keep an ELF header. The
+//              one property the caller does not pick is the DEVICE the mapping is backed
+//              by, which the filesystem assigns: anonymous memory, shmem and memfd are
+//              all major 0, and no unprivileged process can place its memory on a real
+//              block device. Measured on an app process: 380 executable mappings, every
+//              one on a real device except [vdso] and ART's two code caches.
+//              So executable memory on major 0 that no object claims is reported in
+//              full, with its device, inode and name; and the verdict fires only on the
+//              subset that has no legitimate instance at all -- private and anonymous.
 //
 // The whole check runs inside one dl_iterate_phdr callback, which holds the
 // linker's g_dl_mutex, so the object list, the counters and the link_map chain are
@@ -171,8 +172,12 @@ struct Result {
 
   // ---- address-space reconciliation ----
   int ghostExec = 0;    // private anonymous executable pages no object claims
-  int foreignExec = 0;  // executable pages outside the linker's objects that are
-                        // explicable: ART's oat/odex files and its shared code caches
+  int foreignExec = 0;   // unclaimed executable pages on a real device: a file the
+                         // linker did not load
+  int volatileExec = 0;  // unclaimed executable pages on no device at all -- anonymous,
+                         // shmem or memfd. Reported, not a verdict: ART's two code
+                         // caches live here too and cannot be told apart by any key the
+                         // process is unable to forge.
   int anonBacked = 0;
   int extentHoles = 0;
   int phdrMismatch = 0;

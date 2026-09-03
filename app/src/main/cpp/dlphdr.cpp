@@ -141,6 +141,8 @@ struct Region {
   uintptr_t start = 0, end = 0;
   int perms = 0;
   bool shared = false;
+  unsigned devMajor = 0, devMinor = 0;
+  unsigned long inode = 0;
   std::string path;
 };
 
@@ -155,13 +157,18 @@ std::vector<Region> scanMaps() {
     if (line[n - 1] == '\n') line[n - 1] = '\0';
     uintptr_t start = 0, end = 0;
     char perm[8] = {0};
+    unsigned major = 0, minor = 0;
+    unsigned long inode = 0;
     int pathOff = 0;
-    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %*x %*x:%*x %*u %n", &start, &end, perm,
-               &pathOff) < 3)
+    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %*x %x:%x %lu %n", &start, &end, perm, &major,
+               &minor, &inode, &pathOff) < 6)
       continue;
     Region r;
     r.start = start;
     r.end = end;
+    r.devMajor = major;
+    r.devMinor = minor;
+    r.inode = inode;
     if (perm[0] == 'r') r.perms |= PROT_READ;
     if (perm[1] == 'w') r.perms |= PROT_WRITE;
     if (perm[2] == 'x') r.perms |= PROT_EXEC;
@@ -502,25 +509,40 @@ Result Run() {
     if (r.path == "[vdso]" || r.path == "[sigpage]" || r.path == "[vectors]") continue;
     if (claimed(r.start, r.end)) continue;
 
-    // Sort what is left by the two properties the process cannot lie about. A file-backed
-    // mapping the linker did not load is ordinary -- ART's oat and odex are exactly that.
-    // A shared mapping is the shape of a code cache, which the runtime creates by
-    // memfd. Private, anonymous and executable is the one shape nothing legitimate
-    // produces, and it is precisely what a loader that keeps its code out of the linker's
-    // list leaves behind. An ELF header is reported when present but is NOT required:
-    // manually mapped code need not keep one.
-    const bool file_backed = !r.path.empty() && r.path[0] == '/';
+    // Classify by the device the mapping is backed by. That number comes from the
+    // filesystem, not from the caller, so unlike the pathname, the sharing bit and the
+    // page contents it cannot be chosen: an unprivileged process cannot make its memory
+    // appear to live on /dev/block/dm-6. Anonymous memory, shmem and memfd all land on
+    // major 0; every real library is on a real device (measured: 380 executable mappings
+    // in an app process, all on fe:xx or 07:xx but [vdso] and ART's two code caches).
+    //
+    // Do NOT try to excuse the code caches by name, by the sharing bit or by looking for
+    // a writable view of the same inode. The first two are arguments the caller picks --
+    // memfd_create takes the name, mmap takes MAP_SHARED -- and the third was measured
+    // false: /memfd:jit-zygote-cache is mapped r--s and r-xs only, with no writable
+    // sibling, so that rule would flag a clean device. Executable memory on major 0 is
+    // therefore reported in full and left for a human, while the verdict stays on the
+    // one shape that has no legitimate instance at all.
     const bool elf = looksLikeElf(maps, runStart(maps, i));
-    std::string d = hex(r.start) + "-" + hex(r.end) + " " +
+    char dev[32];
+    snprintf(dev, sizeof(dev), "%02x:%02x", r.devMajor, r.devMinor);
+    std::string d = hex(r.start) + "-" + hex(r.end) + " " + (r.shared ? "shared " : "private ") +
+                    dev + " ino " + std::to_string(r.inode) + " " +
                     (r.path.empty() ? "<anonymous>" : r.path) + (elf ? " [ELF image]" : "");
-    if (file_backed || r.shared) {
-        res.foreignExec++;
-        LOGD("executable mapping outside the linker's objects: %s", d.c_str());
-        continue;
+    if (r.devMajor != 0) {
+      // A real file the linker did not load. ART's compiled code is dlopen'd, so it is
+      // already claimed; anything here is worth a look but is not by itself anomalous.
+      res.foreignExec++;
+      LOGD("executable mapping outside the linker's objects: %s", d.c_str());
+      continue;
     }
-    res.ghostExec++;
-    LOGI("private anonymous executable mapping claimed by no linker object: %s", d.c_str());
-    res.findings.push_back({"ghost", d});
+    res.volatileExec++;
+    LOGI("executable memory on no real device, claimed by no linker object: %s", d.c_str());
+    res.findings.push_back({"volatile-exec", d});
+    if (!r.shared && r.path.empty()) {
+      res.ghostExec++;
+      res.findings.push_back({"ghost", "private anonymous executable memory: " + d});
+    }
   }
 
   for (const auto &o : res.objects) {
@@ -581,14 +603,16 @@ Result Run() {
            "\"blocksCovered\":%d,\"gapRuns\":%d,\"freeBlocks\":%d,\"inversions\":%d,"
            "\"unaccountedFrees\":%ld,"
            "\"calibrated\":%s,\"calibFailed\":%s,\"calib\":[%ld,%ld,%ld,%ld],\"ghostExec\":%d,"
-           "\"anonBacked\":%d,\"extentHoles\":%d,\"foreignExec\":%d,\"phdrMismatch\":%d,"
+           "\"anonBacked\":%d,\"extentHoles\":%d,\"foreignExec\":%d,\"volatileExec\":%d,"
+           "\"phdrMismatch\":%d,"
            "\"badName\":%d,\"execMemory\":\"%s\",\"findings\":[",
            res.entries, res.chainLength, res.chainMismatch, res.unmatched, res.adds, res.subs,
            res.ledger, res.countersValid ? "true" : "false", res.stride, res.blocksCovered,
            res.gapRuns, res.freeBlocks, res.inversions, res.unaccountedFrees,
            res.calibrated ? "true" : "false",
            res.calibFailed ? "true" : "false", res.dEntries, res.dChain, res.dAdds, res.dSubs,
-           res.ghostExec, res.anonBacked, res.extentHoles, res.foreignExec, res.phdrMismatch,
+           res.ghostExec, res.anonBacked, res.extentHoles, res.foreignExec, res.volatileExec,
+           res.phdrMismatch,
            res.badName, res.execMemory.c_str());
   std::string j = head;
   bool first = true;
