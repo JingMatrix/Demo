@@ -2,6 +2,8 @@
 // and report each check as JSON, so MainActivity can render them alongside the
 // isolated-process mount probes.
 
+#include <optional>
+
 #include "atexit.hpp"
 #include "dlphdr.hpp"
 #include "logging.h"
@@ -63,11 +65,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
     bool first = true;
     bool any = false;
 
-    // 1. injected shared library, found by walking the linker's solist. This is the
-    //    only check that can name the library: it reads the soname and realpath the
-    //    linker itself recorded, which /proc/self/maps does not carry.
-    // A walk that could not start is not a clean walk. Reporting the two apart matters:
-    // this detector was silently failing open on Android 17 for months.
+    // 1. injected shared library, named from the linker's own soname and realpath
     bool solist_ready = SoList::Initialize();
     std::vector<SoList::Finding> sos = solist_ready ? SoList::DetectAll() : std::vector<SoList::Finding>();
     if (!solist_ready) {
@@ -89,33 +87,22 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
     }
 
     // 2. anonymous executable mapping shadowing a file (from /proc/self/maps)
-    VirtualMap::MapInfo *vm = VirtualMap::DetectInjection();
+    std::optional<VirtualMap::MapInfo> vm = VirtualMap::DetectInjection();
     if (vm) {
         any = true;
-        add(arr, first, "injection", "Virtual-map injection", true, vm->path);
+        add(arr, first, "injection", "Virtual-map injection", true, VirtualMap::Describe(*vm));
     } else {
         add(arr, first, "injection", "Virtual-map injection", false, "no anonymous exec mapping over a file");
     }
 
-    // 3. g_module_unload_counter. Informational only, never a verdict: a stock
-    //    Pixel 7 on Android 17 reports 7 here because zygote genuinely unloads that
-    //    many libraries during preload, and Samsung and OnePlus are worse. The
-    //    number becomes evidence only once it is cross-checked against the
-    //    allocator's free list, which is what "Soinfo block gaps" below does.
+    // 3. g_module_unload_counter. Informational: a stock Pixel 7 reports 7 from zygote's
+    //    own preload. It becomes evidence only cross-checked against the free list.
     size_t mods = SoList::DetectModules();
     add(arr, first, "injection", "Module counter", false,
         std::to_string(mods) +
             " library unload(s) recorded by the linker -- a count alone proves nothing; see Soinfo block gaps");
 
-    // 4. linker state reached through dl_iterate_phdr only -- no /linker symbol
-    //    table, no guessed soinfo offsets, so these hold on every Android release.
-    //    (a) the accounting identity between the enumerated objects and the
-    //    linker's own load/unload counters, plus the second opinion the r_debug
-    //    link_map chain gives on the same list;
-    //    (b) holes and recycled blocks in the fixed-stride soinfo allocation, the
-    //    trace an unlinked library leaves behind;
-    //    (c) whether the ledger still tracks a live load we perform ourselves;
-    //    (d) executable pages the linker vouches for versus what is really mapped.
+    // 4. linker state through dl_iterate_phdr only -- no symbols, no guessed offsets.
     DlPhdr::Result dp = DlPhdr::Run();
 
     bool ledger_bad = dp.ledger < 0 || dp.chainMismatch != 0 || dp.unmatched != 0;
@@ -130,7 +117,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
                               : " -- all three agree")
             : "dlpi_adds/dlpi_subs unavailable on this platform");
 
-    bool gaps_bad = dp.unaccountedFrees > 0;
+    // A reclaimed block counts: unlike the counter, the allocator's memory of the event
+    // is not the injector's to edit. Weaker, though -- an ordinary dlopen/dlclose/dlopen
+    // produces one too, so the detail keeps the two apart.
+    bool gaps_bad = dp.unaccountedFrees > 0 || dp.unloadTrace();
     if (gaps_bad)
         any = true;
     if (dp.stride == 0) {
@@ -143,10 +133,15 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
                         " on the free list in " + std::to_string(dp.gapRuns) + " hole(s), " +
                         std::to_string(dp.inversions) + " reclaimed out of load order, against " +
                         std::to_string((unsigned long long)dp.subs) + " unload(s) the linker admits";
-        d += gaps_bad ? " -- " + std::to_string(dp.unaccountedFrees) +
-                            " freed block(s) the unload counter does not account for"
-                      : (dp.unloadTrace() ? " -- consistent, every freed block is accounted for"
-                                          : " -- the allocation sequence is unbroken");
+        if (dp.unaccountedFrees > 0)
+            d += " -- " + std::to_string(dp.unaccountedFrees) +
+                 " freed block(s) the unload counter does not account for, which no unmodified "
+                 "linker can produce";
+        else if (dp.unloadTrace())
+            d += " -- the count matches dlpi_subs, but a block was still handed back out of "
+                 "load order, which a process that never unloaded anything cannot show";
+        else
+            d += " -- the allocation sequence is unbroken";
         add(arr, first, "injection", "Soinfo block gaps", gaps_bad, d);
     }
 
@@ -169,8 +164,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
             "code caches live here and cannot be told apart by any key a process cannot forge), " +
             std::to_string(dp.foreignExec) + " on a real device the linker did not load");
 
-    // 5. whether this sandbox even permits executable memory the linker never saw.
-    //    Informational: it is what decides how much the check above proves.
+    // 5. informational: decides how much the check above proves.
     add(arr, first, "injection", "Executable memory policy", false, dp.execMemory);
 
     // 6. libc atexit array state (informational integrity signal)

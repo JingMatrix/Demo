@@ -10,9 +10,6 @@ namespace SoList {
 
 namespace {
 
-// The linker's static list head, main-executable soinfo, and vdso soinfo. Kept in
-// this translation unit only: the previous header declared them at namespace scope
-// so every including file got its own always-null copy.
 SoInfo *solinker = nullptr;
 SoInfo *somain = nullptr;
 SoInfo *vdso = nullptr;
@@ -21,23 +18,17 @@ uint64_t *g_module_unload_counter = nullptr;
 bool initialized = false;
 bool initialize_failed = false;
 
-// How far into soinfo the heuristics are willing to look, and the window a
-// plausible mapped-image size falls in.
 constexpr size_t kSearchBytes = 1024;
 constexpr size_t kSizeMax = 0x100000;
 constexpr size_t kSizeMin = 0x100;
 
-// Build "<prefix><llvm suffix>" for a file-local linker symbol. The suffix is
-// learned once from somain, whose unsuffixed name we know.
 std::string suffixed(const char *prefix, const std::string &suffix) {
   return std::string(prefix) + suffix;
 }
 
-// Re-derive the soinfo layout against the linker's own soinfo, which we can
-// recognise independently: its next pointer is somain (or vdso), its link_map
-// carries the linker's path, and somain's size is a plausible image size. Starting
-// from the AOSP offsets means a stock build confirms them on the first probe and a
-// vendor build that shifted a field is corrected rather than misread.
+// Confirm the compile-time offsets against the linker's own soinfo, which is
+// recognisable independently: next points at somain or vdso, and its link_map names
+// the linker.
 bool findHeuristicOffsets(const std::string &linker_path) {
   LOGD("compile-time offsets [size, next, constructors_called, realpath]: "
        "[%zu, %zu, %zu, %zu]",
@@ -73,8 +64,6 @@ bool findHeuristicOffsets(const std::string &linker_path) {
     if (!next_found) continue;
 
     if (!ctor_found) {
-      // constructors_called sits one link_map after the list pointers, and the
-      // link_map of the linker names the linker itself.
       auto *link_map_head = reinterpret_cast<link_map *>(field_of_solinker);
       const size_t index_gap = (sizeof(link_map) + sizeof(void *) - 1) / sizeof(void *);
       const uintptr_t look_forward = field_of_solinker + index_gap * sizeof(void *);
@@ -109,7 +98,6 @@ bool findHeuristicOffsets(const std::string &linker_path) {
     }
   }
 
-  // next is the only field the walk cannot do without.
   if (!next_found) {
     LOGE("could not locate soinfo::next; the solist walk is not safe on this build");
     return false;
@@ -156,7 +144,6 @@ bool Initialize() {
     suffix.assign(somain_sym.substr(strlen("__dl__ZL6somain")));
   LOGI("linker symbol suffix is \"%s\"", suffix.c_str());
 
-  // Android 16 renamed solist to solinker; try the new name first.
   solinker = ElfParser::resolveSymbolPointer<SoInfo>(linker, suffixed("__dl__ZL8solinker", suffix));
   if (solinker == nullptr)
     solinker = ElfParser::resolveSymbolPointer<SoInfo>(linker, suffixed("__dl__ZL6solist", suffix));
@@ -167,8 +154,6 @@ bool Initialize() {
   }
   LOGI("found the soinfo list head at %p", solinker);
 
-  // Everything from here down is optional: a build that hides one of these should
-  // weaken the walk, never disable it.
   somain = ElfParser::resolveSymbolPointer<SoInfo>(linker, std::string(somain_sym));
   vdso = ElfParser::resolveSymbolPointer<SoInfo>(linker, suffixed("__dl__ZL4vdso", suffix));
   LOGI("somain %p, vdso %p", somain, vdso);
@@ -178,7 +163,6 @@ bool Initialize() {
   SoInfo::get_soname_sym = ElfParser::findDirectSymbol<decltype(SoInfo::get_soname_sym)>(
       linker, "__dl__ZNK6soinfo10get_sonameEv");
 
-  // The counters are file-local too, so they take the suffix like everything else.
   g_module_unload_counter = ElfParser::findDirectSymbol<uint64_t>(
       linker, suffixed("__dl__ZL23g_module_unload_counter", suffix));
   if (g_module_unload_counter == nullptr)
@@ -204,9 +188,6 @@ std::vector<Finding> DetectAll() {
     const char *name = iter->get_name();
     const std::string label = (name != nullptr && name[0] != '\0') ? name : "<unnamed>";
 
-    // The linker records a realpath for everything it loads from a file, and a
-    // bracketed pseudo-name ("[vdso]") for what it does not. An empty one means
-    // somebody built an soinfo by hand or blanked the record.
     if (path == nullptr || path[0] == '\0') {
       out.push_back({iter, label + " has no recorded path"});
       continue;
@@ -216,8 +197,6 @@ std::vector<Finding> DetectAll() {
       continue;
     }
 
-    // A library loaded from an anonymous file, or out of a root solution's private
-    // tree: the standard ways to inject code without leaving it on disk.
     bool flagged = false;
     for (const char *needle : {"/memfd:", "(deleted)", "jit-cache-zygisk", "zygisk", "/data/adb",
                                "/debug_ramdisk"}) {
@@ -229,7 +208,6 @@ std::vector<Finding> DetectAll() {
     }
     if (flagged) continue;
 
-    // A path the linker recorded but that no longer resolves on disk.
     if (path[0] == '/' && !fileExists(path))
       out.push_back({iter, label + " records the path " + path + ", which does not exist"});
   }

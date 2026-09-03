@@ -45,9 +45,7 @@ size_t pageSize() {
   return ps;
 }
 
-// Walk the link_map chain hanging off r_debug. Called from inside the
-// dl_iterate_phdr callback, so the linker's g_dl_mutex is held and neither the
-// chain nor the counters can move while we read them.
+// Called from inside the dl_iterate_phdr callback, so g_dl_mutex is held.
 void walkDebugMap(uintptr_t rdebug, Snapshot *snap) {
   auto *rd = reinterpret_cast<struct r_debug *>(rdebug);
   if (rd->r_version != 1 && rd->r_version != 2) return;
@@ -85,15 +83,12 @@ int collect(struct dl_phdr_info *info, size_t size, void *data) {
   for (size_t i = 0; i < o.phnum; i++) {
     const ElfW(Phdr) &ph = info->dlpi_phdr[i];
     if (ph.p_type == PT_INTERP) {
-      // Only the main executable carries one, and it names the ELF interpreter.
-      // Both of them are mapped by the kernel, not by the linker, so neither obeys
-      // the linker's one-reservation-per-object rule.
+      // Main executable and interpreter are mapped by the kernel, not the linker.
       o.kernelMapped = true;
       if (snap->interp.empty())
         snap->interp = reinterpret_cast<const char *>(o.base + ph.p_vaddr);
     }
     if (ph.p_type == PT_DYNAMIC && !snap->chainAvailable) {
-      // DT_DEBUG is filled in by the linker at startup with the address of r_debug.
       auto *dyn = reinterpret_cast<ElfW(Dyn) *>(o.base + ph.p_vaddr);
       for (; dyn->d_tag != DT_NULL; dyn++) {
         if (dyn->d_tag == DT_DEBUG && dyn->d_un.d_ptr != 0) {
@@ -122,8 +117,7 @@ Snapshot enumerate() {
   // The interpreter and the vdso are placed by the kernel too.
   for (auto &o : s.objects)
     if (o.name == "[vdso]" || (!s.interp.empty() && o.name == s.interp)) o.kernelMapped = true;
-  // dlpi_name IS soinfo::link_map_head.l_name, so pointer identity ties each object
-  // to its block without relying on names being unique or on either order.
+  // dlpi_name is soinfo::link_map_head.l_name, so pointer identity ties object to block.
   for (auto &o : s.objects) {
     for (const auto &n : s.nodes) {
       if (n.namePtr == o.namePtr && o.namePtr != 0) {
@@ -190,18 +184,11 @@ bool readableAt(const std::vector<Region> &maps, uintptr_t addr, size_t len) {
   return false;
 }
 
-// Is this run of mappings an ELF image? A dlopen'd library always has its ELF
-// header at the start of its first segment; ART's JIT code caches, signal
-// trampolines and stubs never do. Testing the shape rather than the pathname
-// matters here, because a loader that wants to blend in simply calls its memfd
-// "jit-cache" -- which is exactly what Zygisk implementations do.
 bool looksLikeElf(const std::vector<Region> &maps, uintptr_t addr) {
   if (!readableAt(maps, addr, SELFMAG)) return false;
   return memcmp(reinterpret_cast<const void *>(addr), ELFMAG, SELFMAG) == 0;
 }
 
-// Walk back from an executable mapping to the start of the contiguous run it
-// belongs to: the ELF header sits in the read-only segment before the text.
 uintptr_t runStart(const std::vector<Region> &maps, size_t idx) {
   uintptr_t start = maps[idx].start;
   for (size_t i = idx; i-- > 0;) {
@@ -231,10 +218,7 @@ void jesc(const std::string &in, std::string &out) {
   }
 }
 
-// Can this process create executable memory that is not backed by a file? The answer
-// decides how much the reconciliation above is worth: where the sandbox forbids it,
-// any anonymous executable page at all is conclusive, and where it does not, an
-// injector can hold its code in memory the linker was never told about.
+// Calibrates how much an unclaimed executable mapping is worth on this device.
 std::string probeExecMemory() {
   const size_t ps = pageSize();
   std::string out;
@@ -276,8 +260,6 @@ Result Run() {
   if (!snap.countersValid) {
     res.findings.push_back({"ledger", "dl_phdr_info was too short to carry dlpi_adds/dlpi_subs"});
   } else if (res.ledger < 0) {
-    // Only the negative side is evidence: a dlopen that failed to link raises the
-    // residual benignly, but nothing legitimate lowers it.
     char b[256];
     snprintf(b, sizeof(b),
              "%ld object(s) enumerated but the linker's ledger says %lld (adds %llu - subs %llu): "
@@ -377,9 +359,7 @@ Result Run() {
         }
         if (o->block < it->second->block) {
           res.inversions++;
-          // Name the objects that bracket the reclaimed block. Their position in the
-          // enumeration says WHEN the hole was made: neighbours from early in zygote's
-          // preload mean the free happened long before this process was forked.
+          // Where the hole sits says when it was made.
           std::string below = "?", above = "?";
           long belowIdx = -1, aboveIdx = -1;
           for (size_t k = 0; k < withBlock.size(); k++) {
@@ -405,9 +385,7 @@ Result Run() {
         it->second = o;
       }
 
-      // Cross-check the allocator's memory of what was freed against the linker's.
-      // Slack is fine: an unload whose block is handed straight back leaves nothing
-      // behind. An excess is not: it means the counter was edited downwards.
+      // The allocator and the counter record the same events; an excess is impossible.
       if (res.countersValid) {
         long observed = res.freeBlocks + res.inversions;
         long admitted = static_cast<long>(res.subs);
@@ -434,10 +412,8 @@ Result Run() {
   }
 
   // ----------------------------------------------------------------- calibration
-  // libcalib.so is ours: no dependencies, no constructors, no TLS. The linker has to
-  // account for it. We do not demand exact deltas -- another thread may load
-  // something while we look -- only that the object shows up in both views and that
-  // the ledger still balances.
+  // libcalib.so has no dependencies and no constructors. Deltas are not required to be
+  // exactly one -- another thread may load something while we look.
   void *h = dlopen("libcalib.so", RTLD_NOW | RTLD_LOCAL);
   if (h == nullptr) {
     const char *e = dlerror();
@@ -462,7 +438,6 @@ Result Run() {
                            ? static_cast<long>(after.objects.size()) -
                                  static_cast<long>(after.adds - after.subs)
                            : 0;
-    // Same asymmetry as above: a concurrent failed dlopen may raise it, never lower it.
     if (afterLedger > 0) afterLedger = 0;
     dlclose(h);
 
@@ -490,8 +465,7 @@ Result Run() {
   }
 
   // ------------------------------------------------------ address-space reconcile
-  // Bracket the maps scan with a second enumeration: a library loaded by another
-  // thread while we read /proc/self/maps would otherwise look like a ghost.
+  // Bracket the maps scan with a second enumeration so a concurrent load is not a ghost.
   std::vector<Region> maps = scanMaps();
   Snapshot later = enumerate();
 
@@ -509,20 +483,10 @@ Result Run() {
     if (r.path == "[vdso]" || r.path == "[sigpage]" || r.path == "[vectors]") continue;
     if (claimed(r.start, r.end)) continue;
 
-    // Classify by the device the mapping is backed by. That number comes from the
-    // filesystem, not from the caller, so unlike the pathname, the sharing bit and the
-    // page contents it cannot be chosen: an unprivileged process cannot make its memory
-    // appear to live on /dev/block/dm-6. Anonymous memory, shmem and memfd all land on
-    // major 0; every real library is on a real device (measured: 380 executable mappings
-    // in an app process, all on fe:xx or 07:xx but [vdso] and ART's two code caches).
-    //
-    // Do NOT try to excuse the code caches by name, by the sharing bit or by looking for
-    // a writable view of the same inode. The first two are arguments the caller picks --
-    // memfd_create takes the name, mmap takes MAP_SHARED -- and the third was measured
-    // false: /memfd:jit-zygote-cache is mapped r--s and r-xs only, with no writable
-    // sibling, so that rule would flag a clean device. Executable memory on major 0 is
-    // therefore reported in full and left for a human, while the verdict stays on the
-    // one shape that has no legitimate instance at all.
+    // The device number is assigned by the filesystem, not chosen by the caller. Anonymous
+    // memory, shmem and memfd are all major 0. Do not key on the name, the sharing bit or
+    // an ELF header: all three are the caller's to set, and /memfd:jit-zygote-cache has no
+    // writable sibling, so that test would flag a clean device.
     const bool elf = looksLikeElf(maps, runStart(maps, i));
     char dev[32];
     snprintf(dev, sizeof(dev), "%02x:%02x", r.devMajor, r.devMinor);
@@ -530,8 +494,6 @@ Result Run() {
                     dev + " ino " + std::to_string(r.inode) + " " +
                     (r.path.empty() ? "<anonymous>" : r.path) + (elf ? " [ELF image]" : "");
     if (r.devMajor != 0) {
-      // A real file the linker did not load. ART's compiled code is dlopen'd, so it is
-      // already claimed; anything here is worth a look but is not by itself anomalous.
       res.foreignExec++;
       LOGD("executable mapping outside the linker's objects: %s", d.c_str());
       continue;
@@ -553,9 +515,6 @@ Result Run() {
     }
     if (o.hi == 0) continue;
 
-    // The main executable, the interpreter and the vdso are placed by the kernel,
-    // which does not reserve one contiguous range per object, so the reservation
-    // rules below simply do not apply to them.
     if (!o.kernelMapped) {
       uintptr_t cursor = o.lo;
       for (const auto &r : maps) {
@@ -565,8 +524,7 @@ Result Run() {
           res.findings.push_back({"hole", o.name + ": " + hex(cursor) + "-" + hex(r.start) +
                                               " inside its reservation is not mapped at all"});
         }
-        // Spoofing works by mremap'ing an anonymous copy over a library, leaving the
-        // linker pointing at pages the kernel attributes to no file.
+        // An mremap'd anonymous copy leaves the linker pointing at pages no file backs.
         if ((r.perms & PROT_EXEC) && r.path.empty()) {
           res.anonBacked++;
           res.findings.push_back({"anon", o.name + ": executable " + hex(r.start) + "-" +
