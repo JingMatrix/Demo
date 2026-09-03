@@ -59,8 +59,10 @@ final class ProcScanner {
     // The mount-trace detection core lives in native librecon.so: mount
     // reconciliation (statx/statfs vs mountinfo), the orphaned-mount and peer-group
     // consistency checks -- the mount checks the main process runs, ported here so
-    // the isolated probe carries them too. Only MOUNT traces are shared; the
-    // injection detections (solist/vmap/atexit) stay main-process only.
+    // the isolated probe carries them too. librecon also carries the linker check
+    // (dl_iterate_phdr ledger + soinfo gap analysis), which needs only libdl and so
+    // runs unchanged in an isolated process; the injection detections that need the
+    // linker's symbol table (solist/atexit) stay main-process only.
     private static boolean sReconLoaded;
 
     static {
@@ -74,6 +76,8 @@ final class ProcScanner {
     }
 
     private static native String nativeReconcile();
+
+    private static native String nativeLinkerCheck();
 
     /** Run the native mount reconciliation; never throws (loading may fail). */
     private static JSONObject reconcile() {
@@ -91,6 +95,29 @@ final class ProcScanner {
             return o;
         } catch (Throwable t) {
             Log.w(TAG, "nativeReconcile failed: " + t);
+            return null;
+        }
+    }
+
+    /** Run the native linker-ledger / soinfo-gap check; never throws. */
+    private static JSONObject linkerCheck() {
+        if (!sReconLoaded) {
+            return null;
+        }
+        try {
+            String json = nativeLinkerCheck();
+            JSONObject o = json == null ? null : new JSONObject(json);
+            if (o != null) {
+                pwarn("LINKER entries=" + o.optInt("entries")
+                        + " ledger=" + o.optInt("ledger")
+                        + " freeBlocks=" + o.optInt("freeBlocks")
+                        + " inversions=" + o.optInt("inversions")
+                        + " unaccounted=" + o.optInt("unaccountedFrees")
+                        + "  (dl_iterate_phdr; no linker symbols needed)");
+            }
+            return o;
+        } catch (Throwable t) {
+            Log.w(TAG, "nativeLinkerCheck failed: " + t);
             return null;
         }
     }
@@ -191,6 +218,7 @@ final class ProcScanner {
             out.put("markerHits", markerSummary);
 
             out.put("reconcile", reconcile());
+        out.put("dlphdr", linkerCheck());
             out.put("differential", differentialByFile(procs));
             out.put("crossFile", crossFileDiff(procs));
             out.put("selfVsInit", selfVsInit(procs, selfPid));
@@ -778,6 +806,36 @@ final class ProcScanner {
             }
             if (structural > 0) {
                 reasons.add(structural + " mountinfo tree anomaly(ies): orphaned mount or peer-group gap from an erased record");
+            }
+        }
+
+        // Linker state, reached through dl_iterate_phdr. Only the signals that cannot occur
+        // on an unmodified linker count here: a negative ledger residual (a positive one is
+        // what an ordinary failed dlopen leaves), free-list activity the unload counter does
+        // not account for, and executable memory or program headers the linker disowns.
+        JSONObject linker = scan.optJSONObject("dlphdr");
+        if (linker != null) {
+            if (linker.optInt("ledger") < 0 || linker.optInt("chainMismatch") != 0
+                    || linker.optInt("unmatched") != 0) {
+                reasons.add("linker object list and its own load/unload counters disagree");
+            }
+            int unaccounted = linker.optInt("unaccountedFrees");
+            if (unaccounted > 0) {
+                reasons.add(unaccounted + " soinfo block(s) freed but not accounted for by dlpi_subs"
+                        + " (the unload counter was edited)");
+            }
+            if (linker.optInt("ghostExec") > 0) {
+                reasons.add(linker.optInt("ghostExec")
+                        + " private anonymous executable mapping(s) claimed by no linker object");
+            }
+            int shape = linker.optInt("anonBacked") + linker.optInt("extentHoles")
+                    + linker.optInt("phdrMismatch") + linker.optInt("badName");
+            if (shape > 0) {
+                reasons.add(shape + " linker object(s) whose mapping does not match what the"
+                        + " linker reports for them");
+            }
+            if (linker.optBoolean("calibFailed")) {
+                reasons.add("the linker did not account for a library this probe loaded itself");
             }
         }
 

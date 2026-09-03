@@ -1,189 +1,255 @@
 #include "solist.hpp"
+
+#include <sys/stat.h>
+
+#include <vector>
+
 #include "logging.h"
 
 namespace SoList {
 
-ProtectedDataGuard::FuncType ProtectedDataGuard::ctor = NULL;
-ProtectedDataGuard::FuncType ProtectedDataGuard::dtor = NULL;
+namespace {
 
-size_t DetectModules() {
-  if (g_module_unload_counter == NULL) {
-    LOGI("g_module_unload_counter not found");
-    return 0;
-  } else {
-    return *g_module_unload_counter;
-  }
+// The linker's static list head, main-executable soinfo, and vdso soinfo. Kept in
+// this translation unit only: the previous header declared them at namespace scope
+// so every including file got its own always-null copy.
+SoInfo *solinker = nullptr;
+SoInfo *somain = nullptr;
+SoInfo *vdso = nullptr;
+uint64_t *g_module_unload_counter = nullptr;
+
+bool initialized = false;
+bool initialize_failed = false;
+
+// How far into soinfo the heuristics are willing to look, and the window a
+// plausible mapped-image size falls in.
+constexpr size_t kSearchBytes = 1024;
+constexpr size_t kSizeMax = 0x100000;
+constexpr size_t kSizeMin = 0x100;
+
+// Build "<prefix><llvm suffix>" for a file-local linker symbol. The suffix is
+// learned once from somain, whose unsuffixed name we know.
+std::string suffixed(const char *prefix, const std::string &suffix) {
+  return std::string(prefix) + suffix;
 }
 
-SoInfo *DetectInjection() {
-  if (solinker == NULL && !Initialize()) {
-    LOGE("Failed to initialize solist");
-    return NULL;
+// Re-derive the soinfo layout against the linker's own soinfo, which we can
+// recognise independently: its next pointer is somain (or vdso), its link_map
+// carries the linker's path, and somain's size is a plausible image size. Starting
+// from the AOSP offsets means a stock build confirms them on the first probe and a
+// vendor build that shifted a field is corrected rather than misread.
+bool findHeuristicOffsets(const std::string &linker_path) {
+  LOGD("compile-time offsets [size, next, constructors_called, realpath]: "
+       "[%zu, %zu, %zu, %zu]",
+       SoInfo::solist_size_offset, SoInfo::solist_next_offset,
+       SoInfo::solist_constructors_called_offset, SoInfo::solist_realpath_offset);
+
+  bool size_found = false, next_found = false, ctor_found = false, realpath_found = false;
+  const size_t linker_path_size = linker_path.size();
+
+  for (size_t i = 0; i < kSearchBytes / sizeof(void *); i++) {
+    const uintptr_t field_of_solinker = (uintptr_t)solinker + i * sizeof(void *);
+
+    if (!size_found && somain != nullptr) {
+      size_t size_of_somain = *reinterpret_cast<size_t *>((uintptr_t)somain + i * sizeof(void *));
+      if (size_of_somain < kSizeMax && size_of_somain > kSizeMin) {
+        SoInfo::solist_size_offset = i * sizeof(void *);
+        LOGI("heuristic size offset is %zu", SoInfo::solist_size_offset);
+        size_found = true;
+        continue;
+      }
+    }
+    if (!size_found && somain != nullptr) continue;
+
+    if (!next_found) {
+      void *next_of_solinker = *reinterpret_cast<void **>(field_of_solinker);
+      if (next_of_solinker == somain || (vdso != nullptr && next_of_solinker == vdso)) {
+        SoInfo::solist_next_offset = i * sizeof(void *);
+        LOGI("heuristic next offset is %zu", SoInfo::solist_next_offset);
+        next_found = true;
+        continue;
+      }
+    }
+    if (!next_found) continue;
+
+    if (!ctor_found) {
+      // constructors_called sits one link_map after the list pointers, and the
+      // link_map of the linker names the linker itself.
+      auto *link_map_head = reinterpret_cast<link_map *>(field_of_solinker);
+      const size_t index_gap = (sizeof(link_map) + sizeof(void *) - 1) / sizeof(void *);
+      const uintptr_t look_forward = field_of_solinker + index_gap * sizeof(void *);
+      if (*reinterpret_cast<bool *>(look_forward) && link_map_head->l_addr != 0 &&
+          link_map_head->l_name != nullptr &&
+          strcmp(linker_path.c_str(), link_map_head->l_name) == 0) {
+        SoInfo::solist_constructors_called_offset = look_forward - (uintptr_t)solinker;
+        LOGI("heuristic constructors_called offset is %zu",
+             SoInfo::solist_constructors_called_offset);
+        ctor_found = true;
+        i += index_gap;
+        continue;
+      }
+    }
+    if (!ctor_found) continue;
+
+    // Once get_realpath is callable there is nothing to search for, and every
+    // further step would reinterpret raw soinfo words (phdr, base, dynamic...) as
+    // a std::string and call size()/c_str() on them.
+    if (SoInfo::get_realpath_sym != nullptr) {
+      realpath_found = true;
+      break;
+    }
+
+    auto *realpath_of_solinker = reinterpret_cast<std::string *>(field_of_solinker);
+    if (realpath_of_solinker->size() == linker_path_size &&
+        strcmp(linker_path.c_str(), realpath_of_solinker->c_str()) == 0) {
+      SoInfo::solist_realpath_offset = i * sizeof(void *);
+      LOGI("heuristic realpath offset is %zu", SoInfo::solist_realpath_offset);
+      realpath_found = true;
+      break;
+    }
   }
-  SoInfo *prev = solinker;
-  size_t gap = 0;
-  auto gap_repeated = 0;
-  bool app_process_loaded = false;
-  bool app_specialized = false;
-  const char *libraries_after_specialization[2] = {"libart.so",
-                                                   "libdexfile.so"};
-  bool nativehelper_loaded =
-      false; // Not necessarily loaded after AppSpecialize
 
-  for (auto iter = solinker; iter; iter = iter->get_next()) {
-    // No soinfo has empty path name
-    if (iter->get_path() == NULL || iter->get_path()[0] == '\0') {
-      return iter;
+  // next is the only field the walk cannot do without.
+  if (!next_found) {
+    LOGE("could not locate soinfo::next; the solist walk is not safe on this build");
+    return false;
+  }
+  if (!realpath_found)
+    LOGW("falling back to the compile-time realpath offset %zu", SoInfo::solist_realpath_offset);
+  if (!ctor_found)
+    LOGW("falling back to the compile-time constructors_called offset %zu",
+         SoInfo::solist_constructors_called_offset);
+  return true;
+}
+
+bool fileExists(const char *path) {
+  struct stat st;
+  return path != nullptr && path[0] == '/' && stat(path, &st) == 0;
+}
+
+} // namespace
+
+bool Initialize() {
+  if (initialized) return true;
+  if (initialize_failed) return false;
+
+  ElfParser::ElfImage linker("/linker");
+  if (!linker.isValid()) {
+    LOGE("could not parse the dynamic linker image");
+    initialize_failed = true;
+    return false;
+  }
+
+  // Every file-local linker symbol carries the same .llvm.<hash> suffix, or none.
+  // somain is the one whose unsuffixed spelling is known, so learn it from there.
+  std::string_view somain_sym = linker.findSymbolNameByPrefix("__dl__ZL6somain");
+  if (somain_sym.empty()) {
+    LOGE("could not find the somain symbol in %s", linker.getLibraryPath().c_str());
+    initialize_failed = true;
+    return false;
+  }
+  // LTO appends a ".llvm.<hash>" tag to file-local symbols. The hash has no fixed
+  // width -- a 20-digit one shows up on Android 17 -- so take the whole remainder;
+  // truncating it produces a name that resolves to nothing and the walk fails open.
+  std::string suffix;
+  if (somain_sym.length() > strlen("__dl__ZL6somain"))
+    suffix.assign(somain_sym.substr(strlen("__dl__ZL6somain")));
+  LOGI("linker symbol suffix is \"%s\"", suffix.c_str());
+
+  // Android 16 renamed solist to solinker; try the new name first.
+  solinker = ElfParser::resolveSymbolPointer<SoInfo>(linker, suffixed("__dl__ZL8solinker", suffix));
+  if (solinker == nullptr)
+    solinker = ElfParser::resolveSymbolPointer<SoInfo>(linker, suffixed("__dl__ZL6solist", suffix));
+  if (solinker == nullptr) {
+    LOGE("could not find the head of the linker's soinfo list");
+    initialize_failed = true;
+    return false;
+  }
+  LOGI("found the soinfo list head at %p", solinker);
+
+  // Everything from here down is optional: a build that hides one of these should
+  // weaken the walk, never disable it.
+  somain = ElfParser::resolveSymbolPointer<SoInfo>(linker, std::string(somain_sym));
+  vdso = ElfParser::resolveSymbolPointer<SoInfo>(linker, suffixed("__dl__ZL4vdso", suffix));
+  LOGI("somain %p, vdso %p", somain, vdso);
+
+  SoInfo::get_realpath_sym = ElfParser::findDirectSymbol<decltype(SoInfo::get_realpath_sym)>(
+      linker, "__dl__ZNK6soinfo12get_realpathEv");
+  SoInfo::get_soname_sym = ElfParser::findDirectSymbol<decltype(SoInfo::get_soname_sym)>(
+      linker, "__dl__ZNK6soinfo10get_sonameEv");
+
+  // The counters are file-local too, so they take the suffix like everything else.
+  g_module_unload_counter = ElfParser::findDirectSymbol<uint64_t>(
+      linker, suffixed("__dl__ZL23g_module_unload_counter", suffix));
+  if (g_module_unload_counter == nullptr)
+    g_module_unload_counter =
+        ElfParser::findDirectSymbol<uint64_t>(linker, "__dl__ZL23g_module_unload_counter");
+
+  if (!findHeuristicOffsets(linker.getLibraryPath())) {
+    initialize_failed = true;
+    return false;
+  }
+  initialized = true;
+  return true;
+}
+
+std::vector<Finding> DetectAll() {
+  std::vector<Finding> out;
+  if (!Initialize()) return out;
+
+  size_t walked = 0;
+  for (SoInfo *iter = solinker; iter != nullptr && walked < 8192; iter = iter->get_next()) {
+    walked++;
+    const char *path = iter->get_path();
+    const char *name = iter->get_name();
+    const std::string label = (name != nullptr && name[0] != '\0') ? name : "<unnamed>";
+
+    // The linker records a realpath for everything it loads from a file, and a
+    // bracketed pseudo-name ("[vdso]") for what it does not. An empty one means
+    // somebody built an soinfo by hand or blanked the record.
+    if (path == nullptr || path[0] == '\0') {
+      out.push_back({iter, label + " has no recorded path"});
+      continue;
     }
-
-    if (iter->get_name() == NULL && app_process_loaded) {
-      return iter;
-    }
-
-    if (iter->get_name() == NULL &&
-        strstr(iter->get_path(), "/system/bin/app_proces")) {
-      app_process_loaded = true;
-      // /system/bin/app_process64 maybe set null name
-      LOGD("Skip %s, gap size", iter, iter->get_path());
+    if (path[0] != '/' && path[0] != '[') {
+      out.push_back({iter, label + " has the relative path \"" + path + "\""});
       continue;
     }
 
-    if (iter - prev != gap && gap_repeated < 1) {
-      gap = iter - prev;
-      gap_repeated = 0;
-    } else if (iter - prev == gap) {
-      LOGD("Skip soinfo %p: %s", iter, iter->get_name());
-      gap_repeated++;
-    } else if (iter - prev == 2 * gap) {
-      // A gap appears, indicating that one library was unloaded
-      auto dropped = (SoInfo *)((uintptr_t)prev + gap);
-
-      if (!nativehelper_loaded || !app_specialized) {
-        // gap cannot appear before libnativehelper is loaded
-        return dropped;
-      } else {
-        // gap may appear after any of these libraries is loaded
-        LOGW("%p is dropped between %s and %s", dropped, prev->get_path(),
-             iter->get_path());
-      }
-    } else {
-      gap_repeated--;
-      if (gap != 0)
-        LOGI("Suspicious gap 0x%lx or 0x%lx != 0x%lx between %s and %s",
-             iter - prev, prev - iter, gap, prev->get_name(), iter->get_name());
-    }
-
-    auto name = iter->get_name();
-    if (!app_specialized) {
-      for (int i = 0; i < 2; i++) {
-        if (strcmp(name, libraries_after_specialization[i]) == 0) {
-          app_specialized = true;
-          break;
-        }
-      }
-    }
-
-    if (!nativehelper_loaded && strcmp(name, "libnativehelper.so") == 0) {
-      nativehelper_loaded = true;
-    }
-
-    prev = iter;
-  }
-
-  return nullptr;
-}
-
-bool Initialize() {
-  SandHook::ElfImg linker("/linker");
-  if (!ProtectedDataGuard::setup(linker))
-    return false;
-  LOGI("found symbol ProtectedDataGuard");
-
-  std::string_view somain_sym_name =
-      linker.findSymbolNameByPrefix("__dl__ZL6somain");
-  if (somain_sym_name.empty())
-    return false;
-  LOGI("found symbol name %s", somain_sym_name.data());
-
-  /* INFO: The size isn't a magic number, it's the size for the string:
-   * .llvm.7690929523238822858 */
-  char llvm_sufix[25 + 1];
-
-  if (somain_sym_name.length() != strlen("__dl__ZL6somain")) {
-    strncpy(llvm_sufix, somain_sym_name.data() + strlen("__dl__ZL6somain"),
-            sizeof(llvm_sufix));
-  } else {
-    llvm_sufix[0] = '\0';
-  }
-
-  char solinker_sym_name[sizeof("__dl__ZL8solinker") + sizeof(llvm_sufix)];
-  snprintf(solinker_sym_name, sizeof(solinker_sym_name), "__dl__ZL8solinker%s",
-           llvm_sufix);
-
-  // for SDK < 36 (Android 16), the linker binary is loaded with name solist
-  char solist_sym_name[sizeof("__dl__ZL6solist") + sizeof(llvm_sufix)];
-  snprintf(solist_sym_name, sizeof(solist_sym_name), "__dl__ZL6solist%s",
-           llvm_sufix);
-
-  char sonext_sym_name[sizeof("__dl__ZL6sonext") + sizeof(llvm_sufix)];
-  snprintf(sonext_sym_name, sizeof(sonext_sym_name), "__dl__ZL6sonext%s",
-           llvm_sufix);
-
-  solinker = getStaticPointer<SoInfo>(linker, solinker_sym_name);
-  if (solinker == nullptr) {
-    solinker = getStaticPointer<SoInfo>(linker, solist_sym_name);
-    if (solinker == nullptr)
-      return false;
-    LOGI("found symbol solist at %p", solinker);
-  } else {
-    LOGI("found symbol solinker at %p", solinker);
-  }
-
-  SoInfo::get_realpath_sym =
-      reinterpret_cast<decltype(SoInfo::get_realpath_sym)>(
-          linker.getSymbAddress("__dl__ZNK6soinfo12get_realpathEv"));
-  if (SoInfo::get_realpath_sym != nullptr)
-    LOGI("found symbol get_realpath_sym");
-
-  g_module_unload_counter = reinterpret_cast<decltype(g_module_unload_counter)>(
-      linker.getSymbAddress("__dl__ZL23g_module_unload_counter"));
-  if (g_module_unload_counter != nullptr)
-    LOGI("found symbol g_module_unload_counter");
-
-  somain = getStaticPointer<SoInfo>(linker, somain_sym_name.data());
-  if (solinker == nullptr)
-    return false;
-  LOGI("found symbol somain at %p", somain);
-
-  return findHeuristicOffsets(linker.name());
-}
-
-bool findHeuristicOffsets(std::string linker_name) {
-  const size_t size_block_range = 1024;
-  const size_t linker_realpath_size = linker_name.size();
-
-  bool field_realpath_found = false;
-  for (size_t i = 0; i < size_block_range / sizeof(void *); i++) {
-    auto field_of_solinker =
-        reinterpret_cast<uintptr_t>(solinker) + i * sizeof(void *);
-    auto size_of_somain = *reinterpret_cast<size_t *>(
-        reinterpret_cast<uintptr_t>(somain) + i * sizeof(void *));
-
-    std::string *realpath_of_solinker =
-        reinterpret_cast<std::string *>(field_of_solinker);
-    if (realpath_of_solinker->size() == linker_realpath_size) {
-      if (strcmp(linker_name.c_str(), realpath_of_solinker->c_str()) == 0) {
-        SoInfo::solist_realpath_offset = i * sizeof(void *);
-        LOGI("heuristic field_realpath_offset is %zu * %zu = %p", i,
-             sizeof(void *),
-             reinterpret_cast<void *>(SoInfo::solist_realpath_offset));
-        field_realpath_found = true;
+    // A library loaded from an anonymous file, or out of a root solution's private
+    // tree: the standard ways to inject code without leaving it on disk.
+    bool flagged = false;
+    for (const char *needle : {"/memfd:", "(deleted)", "jit-cache-zygisk", "zygisk", "/data/adb",
+                               "/debug_ramdisk"}) {
+      if (strstr(path, needle) != nullptr) {
+        out.push_back({iter, label + " was loaded from " + path});
+        flagged = true;
         break;
       }
     }
-  }
+    if (flagged) continue;
 
-  return field_realpath_found;
+    // A path the linker recorded but that no longer resolves on disk.
+    if (path[0] == '/' && !fileExists(path))
+      out.push_back({iter, label + " records the path " + path + ", which does not exist"});
+  }
+  LOGI("walked %zu soinfo record(s), %zu suspicious", walked, out.size());
+  return out;
+}
+
+SoInfo *DetectInjection() {
+  std::vector<Finding> all = DetectAll();
+  for (const auto &f : all) LOGI("suspicious soinfo %p: %s", f.info, f.reason.c_str());
+  return all.empty() ? nullptr : all.front().info;
+}
+
+size_t DetectModules() {
+  if (!Initialize()) return 0;
+  if (g_module_unload_counter == nullptr) {
+    LOGI("g_module_unload_counter is not resolvable; see the dl_iterate_phdr ledger instead");
+    return 0;
+  }
+  return *g_module_unload_counter;
 }
 
 } // namespace SoList

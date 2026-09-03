@@ -8,10 +8,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # contained (libc + log only) so it can be shared by every context: the main
 # process (libdemo), the native isolated probe (libmain), and the classic isolated
 # Java probe (loaded directly via System.loadLibrary("recon")).
-add_library(recon SHARED recon.cpp)
+# dlphdr.cpp rides along: it is the linker-ledger / soinfo-gap detector and needs
+# nothing beyond libdl and /proc/self/maps, so every context gets it for free.
+add_library(recon SHARED recon.cpp dlphdr.cpp)
 target_include_directories(recon PRIVATE include)
 target_compile_options(recon PRIVATE -O2)
-target_link_libraries(recon log)
+target_link_libraries(recon log dl)
+
+# "libcalib.so": the calibration probe dlphdr.cpp loads to prove the linker's
+# ledger still moves. Empty on purpose -- no dependencies, no constructors -- so a
+# clean linker answers with exactly one new object and one increment of dlpi_adds.
+add_library(calib SHARED calib.cpp)
+target_compile_options(calib PRIVATE -O2)
 
 # Framework loads "libmain.so" for android:nativeService components (the
 # zygote_next native isolated probe).
@@ -25,7 +33,10 @@ target_link_libraries(main recon log)
 # mount reconciliation).
 # Loaded by MainActivity.
 add_library(demo SHARED
-        integrity.cpp atexit.cpp elf_util.cpp smap.cpp solist.cpp statfs.cpp vmap.cpp mount.cpp)
+        integrity.cpp atexit.cpp elf_parser.cpp smap.cpp solist.cpp statfs.cpp vmap.cpp mount.cpp)
 target_include_directories(demo PRIVATE include)
-target_compile_options(demo PRIVATE -O2)
+# linker_soinfo.h takes offsetof() of a non-standard-layout type on purpose: it is a
+# transcription of AOSP's struct soinfo, and its unused private members are what put
+# the public ones at the right offsets.
+target_compile_options(demo PRIVATE -O2 -Wall -Wno-invalid-offsetof -Wno-unused-private-field)
 target_link_libraries(demo android log recon)

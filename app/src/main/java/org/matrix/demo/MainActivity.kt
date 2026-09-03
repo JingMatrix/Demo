@@ -292,6 +292,7 @@ private fun LazyListScope.reportSection(r: JSONObject, label: String, expanded: 
     item { VerdictCard(r) }
     environmentCard(r)?.let { block -> item { block() } }
     reconcileCard(r.optJSONObject("reconcile"))?.let { block -> item { block() } }
+    linkerCard(r.optJSONObject("dlphdr"))?.let { block -> item { block() } }
     markerHitsCard(r.optJSONArray("markerHits"))?.let { block -> item { block() } }
     differentialCard(r.optJSONObject("differential"))?.let { block -> item { block() } }
     fileAccessCard(r)?.let { block -> item { block() } }
@@ -479,6 +480,66 @@ private fun markerHitsCard(hits: JSONArray?): (@Composable () -> Unit)? {
 
 // Mount reconciliation: kernel stat ground truth vs mountinfo. The one mount check
 // that survives kernel-side mountinfo filtering (KSU mount_hide et al.).
+/** Linker state as dl_iterate_phdr reports it: the ledger identity, the soinfo allocation
+ *  sequence, and the reconciliation of the linker's own PT_LOAD extents against
+ *  /proc/self/maps. Rendered for the isolated probes, which carry the same document as the
+ *  main process but have no per-check list of their own. */
+private fun linkerCard(d: JSONObject?): (@Composable () -> Unit)? {
+    if (d == null) return null
+    val ledger = d.optInt("ledger")
+    val unaccounted = d.optInt("unaccountedFrees")
+    val ghost = d.optInt("ghostExec")
+    val bad = ledger < 0 || unaccounted > 0 || ghost > 0 || d.optInt("chainMismatch") != 0 ||
+        d.optInt("unmatched") != 0 || d.optInt("anonBacked") > 0 ||
+        d.optInt("extentHoles") > 0 || d.optInt("phdrMismatch") > 0 ||
+        d.optInt("badName") > 0 || d.optBoolean("calibFailed")
+    return {
+        StageCard {
+            CardTitle("Linker (dl_iterate_phdr) — ${d.optInt("entries")} objects, " +
+                "ledger residual $ledger")
+            MonoBlock(
+                monoTable(
+                    listOf("what", "value"),
+                    listOf(
+                        listOf("objects / chain", "${d.optInt("entries")} / ${d.optInt("chain")}"),
+                        listOf("dlpi_adds - dlpi_subs", "${d.optLong("adds")} - ${d.optLong("subs")}"),
+                        listOf("ledger residual", "$ledger  (negative is tampering)"),
+                        listOf("soinfo stride", "${d.optInt("stride")} over ${d.optInt("blocksCovered")} block(s)"),
+                        listOf("free / reclaimed", "${d.optInt("freeBlocks")} / ${d.optInt("inversions")}"),
+                        listOf("unaccounted frees", "$unaccounted  (must be 0)"),
+                        listOf("unclaimed exec (private anon)", "$ghost"),
+                        listOf("unclaimed exec (file/shared)", "${d.optInt("foreignExec")}"),
+                        listOf("exec-memory policy", d.optString("execMemory")),
+                    ),
+                ),
+            )
+            val findings = d.optJSONArray("findings")
+            if (findings != null && findings.length() > 0) {
+                val rows = ArrayList<List<String>>(findings.length())
+                for (i in 0 until findings.length()) {
+                    val f = findings.optJSONObject(i) ?: continue
+                    rows.add(listOf(f.optString("check"), f.optString("detail")))
+                }
+                MonoBlock(monoTable(listOf("check", "detail"), rows))
+            } else {
+                Text(
+                    "the linker's object list, its counters and its allocation sequence all agree",
+                    color = Good,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (bad) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "at least one signal here cannot occur on an unmodified linker",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
 private fun reconcileCard(recon: JSONObject?): (@Composable () -> Unit)? {
     if (recon == null) return null
     val hidden = recon.optInt("hidden")

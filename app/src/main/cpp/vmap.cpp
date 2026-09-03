@@ -61,6 +61,17 @@ void DumpStackStrings() {
   }
 }
 
+// Does an ELF image actually start here? A library mapped by the linker always has
+// its ELF header at the base of the mapping; the runtime's JIT code caches and
+// trampolines never do. Testing the shape rather than the name is what keeps this
+// from firing on [anon_shmem:dalvik-zygote-jit-code-cache], and from being fooled by
+// a loader that names its memfd after one.
+static bool starts_with_elf(const MapInfo &info) {
+  if (!(info.perms & PROT_READ))
+    return true; // cannot look; stay suspicious
+  return memcmp(reinterpret_cast<const void *>(info.start), "\177ELF", 4) == 0;
+}
+
 MapInfo *DetectInjection() {
   int jit_cache_count = 0;
   int jit_zygote_cache_count = 0;
@@ -72,7 +83,14 @@ MapInfo *DetectInjection() {
         continue;
 
       if (!info.path.starts_with("/")) {
-        LOGI("Executable block with path %s", info.path.data());
+        // Anonymous or bracket-named executable memory only matters when it holds a
+        // loaded ELF image. ART's code caches live here too and are not injections.
+        if (!starts_with_elf(info)) {
+          LOGD("Non-ELF executable block %s, not an injected library",
+               info.path.empty() ? "<anonymous>" : info.path.data());
+          continue;
+        }
+        LOGI("Executable ELF image with path %s", info.path.data());
         return &info;
       }
 

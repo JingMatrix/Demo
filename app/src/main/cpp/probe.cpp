@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "dlphdr.hpp"
 #include "recon.hpp"
 
 #define LOG_TAG "DemoProbe"
@@ -246,16 +247,25 @@ static void run_probe(void) {
     int recon_findings = recon_run_json(recon_json, sizeof(recon_json));
     o += snprintf(g_report + o, cap - o, "\"reconcile\":%s,", recon_json);
 
+    // Linker ledger and soinfo gap analysis, the injection counterpart. Worth running
+    // here specifically: this process was forked by zygote_next rather than zygote, so
+    // whether it carries the same injection traces as the main process is itself the
+    // interesting question.
+    char dlphdr_json[16384];
+    int dlphdr_findings = dlphdr_run_json(dlphdr_json, sizeof(dlphdr_json));
+    o += snprintf(g_report + o, cap - o, "\"dlphdr\":%s,", dlphdr_json);
+    logmsg("linker check: %d finding(s)", dlphdr_findings);
+
     // Verdict combines the module markers with the reconciliation (hidden mounts AND
     // structural anomalies). shared:N propagation stays informational: a native
     // zygote_next child is forked without CLONE_NEWNS on STOCK Android 17 too, so
     // "shared:1" is expected here and hiding it would be the real anomaly.
-    bool detected = high_hits > 0 || recon_findings > 0;
+    bool detected = high_hits > 0 || recon_findings > 0 || dlphdr_findings > 0;
     bool global_view = strncmp(prop, "shared:", 7) == 0;
     o += snprintf(g_report + o, cap - o,
                   "\"verdict\":{\"detected\":%s,\"highHits\":%d,\"reconFindings\":%d,"
-                  "\"propagation\":\"%s\",\"globalViewSignature\":%s}}",
-                  detected ? "true" : "false", high_hits, recon_findings, prop,
+                  "\"linkerFindings\":%d,\"propagation\":\"%s\",\"globalViewSignature\":%s}}",
+                  detected ? "true" : "false", high_hits, recon_findings, dlphdr_findings, prop,
                   global_view ? "true" : "false");
 
     g_report_len = o;
