@@ -153,6 +153,22 @@ static void json_escape(const char* in, char* out, size_t out_size) {
     out[o] = '\0';
 }
 
+// snprintf returns what it WOULD have written, so "o += snprintf(buf + o, cap - o, ...)"
+// walks the cursor past the end on the first truncation and every later call then gets
+// cap - o as a huge size_t -- a heap overflow on exactly the devices this probe targets
+// (a rooted phone carries the most mount records). Clamp the cursor instead: once the
+// document is full it stays full and the tail is simply dropped.
+__attribute__((format(printf, 4, 5)))
+static void appendf(char* buf, size_t cap, size_t* o, const char* fmt, ...) {
+    if (*o >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *o, cap - *o, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    *o = (size_t)n >= cap - *o ? cap - 1 : *o + (size_t)n;
+}
+
 static void run_probe(void) {
     pid_t pid = getpid();
     uid_t uid = getuid();
@@ -168,18 +184,23 @@ static void run_probe(void) {
            : "unclassified");
 
     size_t cap = 262144;
+    // Room the variable-length arrays must leave for the fixed tail: the embedded
+    // reconcile and dlphdr documents plus the verdict object. Without it a phone with
+    // enough mounts to fill the buffer would hand back a JSON document that stops
+    // mid-array, and MainActivity's JSONObject(raw) throws the whole report away.
+    const size_t tail_reserve = 28 * 1024;
     g_report = (char*)malloc(cap);
     if (!g_report) return;
     size_t o = 0;
-    o += snprintf(g_report + o, cap - o,
-                  "{\"technique\":\"native-zygote_next\",\"self\":{\"pid\":%d,\"uid\":%d,"
-                  "\"isolated\":true,\"nsMnt\":%" PRIu64 ",\"selfPropagation\":\"%s\"},",
-                  pid, uid, ns, prop);
+    appendf(g_report, cap, &o,
+            "{\"technique\":\"native-zygote_next\",\"self\":{\"pid\":%d,\"uid\":%d,"
+            "\"isolated\":true,\"nsMnt\":%" PRIu64 ",\"selfPropagation\":\"%s\"},",
+            pid, uid, ns, prop);
 
     // scan /proc/self/mountinfo, full lines
     size_t len = 0;
     char* buf = read_all("/proc/self/mountinfo", &len);
-    o += snprintf(g_report + o, cap - o, "\"markerHits\":[");
+    appendf(g_report, cap, &o, "\"markerHits\":[");
     int total_lines = 0, hit_lines = 0, high_hits = 0;
     bool first_hit = true;
 
@@ -206,24 +227,25 @@ static void run_probe(void) {
                 json_escape(line, esc, sizeof(esc));
                 char lab[256];
                 json_escape(labels, lab, sizeof(lab));
-                if (o + strlen(esc) + strlen(lab) + 64 < cap) {
-                    o += snprintf(g_report + o, cap - o, "%s{\"labels\":\"%s\",\"high\":%d,\"line\":\"%s\"}",
-                                  first_hit ? "" : ",", lab, line_high, esc);
+                if (o + strlen(esc) + strlen(lab) + 64 < cap - tail_reserve) {
+                    appendf(g_report, cap, &o,
+                            "%s{\"labels\":\"%s\",\"high\":%d,\"line\":\"%s\"}",
+                            first_hit ? "" : ",", lab, line_high, esc);
                     first_hit = false;
                 }
             }
         }
         free(buf);
     }
-    o += snprintf(g_report + o, cap - o, "],");
+    appendf(g_report, cap, &o, "],");
 
-    o += snprintf(g_report + o, cap - o,
-                  "\"stats\":{\"mountinfoLines\":%d,\"markerLines\":%d,\"highHits\":%d},",
-                  total_lines, hit_lines, high_hits);
+    appendf(g_report, cap, &o,
+            "\"stats\":{\"mountinfoLines\":%d,\"markerLines\":%d,\"highHits\":%d},",
+            total_lines, hit_lines, high_hits);
 
     // include the full (bounded) mountinfo for display
     char* full = read_all("/proc/self/mountinfo", &len);
-    o += snprintf(g_report + o, cap - o, "\"mountinfo\":[");
+    appendf(g_report, cap, &o, "\"mountinfo\":[");
     if (full) {
         char* save;
         bool first = true;
@@ -232,20 +254,20 @@ static void run_probe(void) {
              line = strtok_r(NULL, "\n", &save), emitted++) {
             char esc[1024];
             json_escape(line, esc, sizeof(esc));
-            if (o + strlen(esc) + 8 >= cap) break;
-            o += snprintf(g_report + o, cap - o, "%s\"%s\"", first ? "" : ",", esc);
+            if (o + strlen(esc) + 8 >= cap - tail_reserve) break;
+            appendf(g_report, cap, &o, "%s\"%s\"", first ? "" : ",", esc);
             first = false;
         }
         free(full);
     }
-    o += snprintf(g_report + o, cap - o, "],");
+    appendf(g_report, cap, &o, "],");
 
     // Mount reconciliation: kernel stat ground truth vs mountinfo text. Survives
     // kernel-side mountinfo filtering, so it fires even when every marker line was
     // erased from this process's view.
     char recon_json[8192];
     int recon_findings = recon_run_json(recon_json, sizeof(recon_json));
-    o += snprintf(g_report + o, cap - o, "\"reconcile\":%s,", recon_json);
+    appendf(g_report, cap, &o, "\"reconcile\":%s,", recon_json);
 
     // Linker ledger and soinfo gap analysis, the injection counterpart. Worth running
     // here specifically: this process was forked by zygote_next rather than zygote, so
@@ -253,7 +275,7 @@ static void run_probe(void) {
     // interesting question.
     char dlphdr_json[16384];
     int dlphdr_findings = dlphdr_run_json(dlphdr_json, sizeof(dlphdr_json));
-    o += snprintf(g_report + o, cap - o, "\"dlphdr\":%s,", dlphdr_json);
+    appendf(g_report, cap, &o, "\"dlphdr\":%s,", dlphdr_json);
     logmsg("linker check: %d finding(s)", dlphdr_findings);
 
     // Verdict combines the module markers with the reconciliation (hidden mounts AND
@@ -262,11 +284,11 @@ static void run_probe(void) {
     // "shared:1" is expected here and hiding it would be the real anomaly.
     bool detected = high_hits > 0 || recon_findings > 0 || dlphdr_findings > 0;
     bool global_view = strncmp(prop, "shared:", 7) == 0;
-    o += snprintf(g_report + o, cap - o,
-                  "\"verdict\":{\"detected\":%s,\"highHits\":%d,\"reconFindings\":%d,"
-                  "\"linkerFindings\":%d,\"propagation\":\"%s\",\"globalViewSignature\":%s}}",
-                  detected ? "true" : "false", high_hits, recon_findings, dlphdr_findings, prop,
-                  global_view ? "true" : "false");
+    appendf(g_report, cap, &o,
+            "\"verdict\":{\"detected\":%s,\"highHits\":%d,\"reconFindings\":%d,"
+            "\"linkerFindings\":%d,\"propagation\":\"%s\",\"globalViewSignature\":%s}}",
+            detected ? "true" : "false", high_hits, recon_findings, dlphdr_findings, prop,
+            global_view ? "true" : "false");
 
     g_report_len = o;
     logmsg("native verdict: detected=%s highHits=%d lines=%d json=%zuB",

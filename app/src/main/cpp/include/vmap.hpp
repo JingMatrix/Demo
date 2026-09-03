@@ -1,7 +1,11 @@
+#pragma once
+
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <sys/types.h>
 #include <vector>
+
 namespace VirtualMap {
 
 struct MapInfo {

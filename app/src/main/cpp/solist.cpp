@@ -35,7 +35,12 @@ bool findHeuristicOffsets(const std::string &linker_path) {
        SoInfo::solist_size_offset, SoInfo::solist_next_offset,
        SoInfo::solist_constructors_called_offset, SoInfo::solist_realpath_offset);
 
-  bool size_found = false, next_found = false, ctor_found = false, realpath_found = false;
+  bool size_found = false, next_found = false, ctor_found = false;
+  // get_realpath answers for every soinfo, so with the symbol there is nothing to
+  // search for. Decide this BEFORE the loop: the search below only reaches its
+  // realpath step after the constructors_called step has matched, and on a build
+  // where that never matches the symbol would otherwise go unnoticed.
+  bool realpath_found = SoInfo::get_realpath_sym != nullptr;
   const size_t linker_path_size = linker_path.size();
 
   for (size_t i = 0; i < kSearchBytes / sizeof(void *); i++) {
@@ -80,18 +85,16 @@ bool findHeuristicOffsets(const std::string &linker_path) {
     }
     if (!ctor_found) continue;
 
-    // Once get_realpath is callable there is nothing to search for, and every
+    // Once realpath is resolved there is nothing left to search for, and every
     // further step would reinterpret raw soinfo words (phdr, base, dynamic...) as
     // a std::string and call size()/c_str() on them.
-    if (SoInfo::get_realpath_sym != nullptr) {
-      realpath_found = true;
-      break;
-    }
+    if (realpath_found) break;
 
     auto *realpath_of_solinker = reinterpret_cast<std::string *>(field_of_solinker);
     if (realpath_of_solinker->size() == linker_path_size &&
         strcmp(linker_path.c_str(), realpath_of_solinker->c_str()) == 0) {
       SoInfo::solist_realpath_offset = i * sizeof(void *);
+      SoInfo::realpath_offset_confirmed = true;
       LOGI("heuristic realpath offset is %zu", SoInfo::solist_realpath_offset);
       realpath_found = true;
       break;
@@ -102,8 +105,16 @@ bool findHeuristicOffsets(const std::string &linker_path) {
     LOGE("could not locate soinfo::next; the solist walk is not safe on this build");
     return false;
   }
-  if (!realpath_found)
-    LOGW("falling back to the compile-time realpath offset %zu", SoInfo::solist_realpath_offset);
+  // Every finding this file produces is a sentence built from get_path()/get_name(),
+  // and both reinterpret raw soinfo words as a std::string. Confirmed nowhere, the
+  // compile-time offset would have us call c_str() on whatever word sits there --
+  // a segfault in the app's own main process for a walk that could not have named
+  // anything anyway. Report the walk as unavailable instead.
+  if (!realpath_found) {
+    LOGE("neither soinfo::get_realpath nor the realpath offset could be confirmed; "
+         "the walk cannot name a library without reading arbitrary words as std::string");
+    return false;
+  }
   if (!ctor_found)
     LOGW("falling back to the compile-time constructors_called offset %zu",
          SoInfo::solist_constructors_called_offset);
@@ -186,7 +197,11 @@ std::vector<Finding> DetectAll() {
     walked++;
     const char *path = iter->get_path();
     const char *name = iter->get_name();
-    const std::string label = (name != nullptr && name[0] != '\0') ? name : "<unnamed>";
+    // Initialize() guarantees a readable path; the soname needs its own symbol, so
+    // fall back to the path rather than reporting every library as "<unnamed>".
+    const std::string label = (name != nullptr && name[0] != '\0')  ? name
+                              : (path != nullptr && path[0] != '\0') ? path
+                                                                     : "<unnamed>";
 
     if (path == nullptr || path[0] == '\0') {
       out.push_back({iter, label + " has no recorded path"});

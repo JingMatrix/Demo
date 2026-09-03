@@ -230,7 +230,8 @@ std::string probeExecMemory() {
   }
   void *b = mmap(nullptr, ps, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
                  -1, 0);
-  out += b != MAP_FAILED ? ", anonymous rwx map allowed" : ", anonymous rwx map denied";
+  if (!out.empty()) out += ", ";
+  out += b != MAP_FAILED ? "anonymous rwx map allowed" : "anonymous rwx map denied";
   if (b != MAP_FAILED) munmap(b, ps);
   return out;
 }

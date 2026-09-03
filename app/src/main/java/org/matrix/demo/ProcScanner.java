@@ -218,7 +218,7 @@ final class ProcScanner {
             out.put("markerHits", markerSummary);
 
             out.put("reconcile", reconcile());
-        out.put("dlphdr", linkerCheck());
+            out.put("dlphdr", linkerCheck());
             out.put("differential", differentialByFile(procs));
             out.put("crossFile", crossFileDiff(procs));
             out.put("selfVsInit", selfVsInit(procs, selfPid));

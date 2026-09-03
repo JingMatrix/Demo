@@ -270,18 +270,21 @@ std::string_view ElfImage::findSymbolNameByPrefix(std::string_view prefix) {
 
 bool ElfImage::findLoadedLibraryInfo(std::string_view library_name) {
     struct LibraryInfo {
-        std::string_view name;
+        const char* name;  // NUL-terminated: strstr below reads past the view's length
         std::string* path_out;
         void** base_addr_out;
         bool found;
     };
 
-    LibraryInfo info = {library_name, &library_path_, &base_address_, false};
+    // string_view::data() is not guaranteed NUL-terminated, and strstr reads until it
+    // finds one. Materialise the name so the needle is always a real C string.
+    const std::string needle(library_name);
+    LibraryInfo info = {needle.c_str(), &library_path_, &base_address_, false};
 
     dl_iterate_phdr(
         [](struct dl_phdr_info* phdr_info, size_t, void* data) -> int {
             auto* lib_info = static_cast<LibraryInfo*>(data);
-            if (phdr_info->dlpi_name && strstr(phdr_info->dlpi_name, lib_info->name.data())) {
+            if (phdr_info->dlpi_name && strstr(phdr_info->dlpi_name, lib_info->name)) {
                 *lib_info->path_out = phdr_info->dlpi_name;
                 *lib_info->base_addr_out = reinterpret_cast<void*>(phdr_info->dlpi_addr);
                 lib_info->found = true;

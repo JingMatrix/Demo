@@ -145,9 +145,12 @@ bool stdev_is_mount(const char *path) {
     return false;
   std::string parent(path);
   auto slash = parent.find_last_of('/');
-  if (slash == std::string::npos || slash == 0)
+  if (slash == std::string::npos)
     return false;
-  parent.resize(slash);
+  // A top-level probe target ("/system") has "/" as its parent, not "". Bailing out
+  // here left every depth-1 overlay target -- the ones a systemless root actually
+  // re-hosts -- with no fallback at all when statx cannot answer.
+  parent.resize(slash == 0 ? 1 : slash);
   if (stat(parent.c_str(), &b) != 0)
     return false;
   return a.st_dev != b.st_dev;

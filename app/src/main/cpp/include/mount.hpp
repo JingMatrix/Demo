@@ -1,6 +1,14 @@
+#pragma once
+
+#include <cstdio>
 #include <functional>
+#include <limits.h>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <sys/types.h>
+#include <vector>
+
 namespace Mount {
 using sFILE = std::unique_ptr<FILE, decltype(&fclose)>;
 sFILE MakeFile(FILE *fp);

@@ -159,6 +159,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onDestroy() {
+        // The 8s safety net holds a reference to this activity; on a configuration
+        // change a stale one would outlive it and flip the new instance's flags.
+        handler.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
     private fun bind(intent: Intent, conn: Conn) {
         try {
             if (!bindService(intent, conn, Context.BIND_AUTO_CREATE)) {
@@ -883,7 +890,7 @@ private fun selfVsInitCard(svi: JSONObject?): (@Composable () -> Unit)? {
                 ),
             )
             val onlyInit = svi.optJSONArray("onlyInInit").toStringList()
-            val onlySelf = svi.optJSONArray("onlySelf").toStringList()
+            val onlySelf = svi.optJSONArray("onlyInSelf").toStringList()
             if (onlyInit.isNotEmpty() || onlySelf.isNotEmpty()) {
                 val lines = onlyInit.map { "in init, not in self: $it" } +
                     onlySelf.map { "in self, not in init: $it" }

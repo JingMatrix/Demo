@@ -29,6 +29,10 @@ android {
                     includeDefault = false
                 }
             }
+            // includeDefault = false drops R8's stock rules, JNI's included. See
+            // proguard-rules.pro: without it every native method is renamed and the
+            // release APK reports CLEAN because every check threw UnsatisfiedLinkError.
+            proguardFiles("proguard-rules.pro")
         }
     }
     compileOptions {

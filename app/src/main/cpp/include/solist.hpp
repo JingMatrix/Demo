@@ -23,6 +23,11 @@ public:
   inline static const char *(*get_realpath_sym)(SoInfo *) = nullptr;
   inline static const char *(*get_soname_sym)(SoInfo *) = nullptr;
 
+  // Set only once the heuristic has matched the linker's own realpath at that offset.
+  // Until then the compile-time value is a guess, and dereferencing it as a std::string
+  // means calling c_str() on whatever soinfo word happens to sit there.
+  inline static bool realpath_offset_confirmed = false;
+
   inline size_t get_size() const {
     return *reinterpret_cast<const size_t *>((uintptr_t)this + solist_size_offset);
   }
@@ -38,11 +43,15 @@ public:
 
   inline const char *get_path() {
     if (get_realpath_sym) return get_realpath_sym(this);
+    if (!realpath_offset_confirmed) return nullptr;
     return reinterpret_cast<std::string *>((uintptr_t)this + solist_realpath_offset)->c_str();
   }
 
+  // soname_ sits directly before realpath_ in soinfo, so the confirmed realpath offset
+  // locates it -- but only that offset does.
   inline const char *get_name() {
     if (get_soname_sym) return get_soname_sym(this);
+    if (!realpath_offset_confirmed) return nullptr;
     return reinterpret_cast<std::string *>((uintptr_t)this + solist_realpath_offset -
                                            sizeof(std::string))
         ->c_str();
