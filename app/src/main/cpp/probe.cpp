@@ -42,8 +42,8 @@ static void logmsg(const char* fmt, ...) {
 }
 
 // ---- wide marker catalogue (needle, label, confidence, wordBoundary) ----
-// wordBoundary avoids false positives like "sui" inside "nosuid" or "ksu" inside
-// a random token; short alpha needles must set it.
+// wordBoundary avoids false positives like "sui" inside "nosuid" or "lsp" inside
+// a longer token; short alpha needles must set it.
 struct Marker { const char* needle; const char* label; int confidence; bool wb; };
 static const Marker MARKERS[] = {
     {"/data/adb", "data/adb", 3, false}, {"/adb/", "adb", 3, false},

@@ -25,8 +25,9 @@
   LOGE(fmt " failed with %d: %s", ##args, errno, strerror(errno))
 
 namespace logging {
-// Optional in-process capture so a caller (e.g. integrity.cpp) can return the raw
-// detection log to the UI. Empty/unused unless capture() is cleared and read.
+// In-process capture so a caller (e.g. integrity.cpp) can return the raw detection
+// log to the UI. Every log() below appends to it, so a caller that wants a single
+// run's log must clear() first -- and one that never reads it lets it grow.
 inline std::string &capture() {
   static std::string buf;
   return buf;

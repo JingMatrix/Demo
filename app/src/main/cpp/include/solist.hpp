@@ -63,8 +63,10 @@ struct Finding {
   std::string reason;
 };
 
-// Idempotent. Every symbol but the list head is optional, so a build that hides one
-// weakens the walk instead of disabling it.
+// Idempotent. Needs the list head and some way to read a realpath -- the symbol, or an
+// offset the heuristic confirmed; without one every finding would be built by casting
+// an unverified soinfo word to std::string. Every other symbol is optional, so a build
+// that hides one weakens the walk instead of disabling it.
 bool Initialize();
 
 SoInfo *DetectInjection();

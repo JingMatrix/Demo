@@ -38,7 +38,6 @@ struct Object {
   uintptr_t phdr = 0;     // dlpi_phdr
   uintptr_t namePtr = 0;  // dlpi_name, which is soinfo::link_map_head.l_name
   uintptr_t block = 0;    // &soinfo::link_map_head, matched from the r_debug chain
-  int region = -1;        // which allocator run that block belongs to
   size_t phnum = 0;
   size_t tlsModId = 0;
   bool kernelMapped = false;  // main executable / interpreter / vdso
@@ -55,7 +54,7 @@ struct Result {
   bool countersValid = false;
   long entries = 0;
   unsigned long long adds = 0, subs = 0;
-  long ledger = 0;  // entries - (adds - subs); zero on a clean linker, never negative
+  long ledger = 0;  // entries - (adds - subs); >= 0 on a clean linker, never negative
 
   // ---- soinfo block gaps ----
   bool chainAvailable = false;
@@ -107,8 +106,9 @@ Result Run();
 }  // namespace DlPhdr
 
 extern "C" {
-// C entry point mirroring recon_run_json, so the pure-C native probe can run the
-// identical check. Writes the JSON document into out and returns the number of
-// hard findings (the ones Result::injected() is built from).
+// C entry point mirroring recon_run_json, so the native probe -- which exposes no C++
+// interface of its own -- can run the identical check. Writes the JSON document into
+// out and returns the number of hard findings (the ones Result::injected() is built
+// from).
 int dlphdr_run_json(char *out, size_t cap);
 }

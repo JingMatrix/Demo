@@ -18,7 +18,7 @@ final class Markers {
 
     static final int HIGH = 3;   // only exists on a rooted/modified device
     static final int MEDIUM = 2; // strongly associated with hiding frameworks
-    static final int LOW = 1;    // common on stock too; context for differentials
+    static final int LOW = 1;    // common on stock too; no entry below uses it today
 
     static final class Marker {
         final String needle;

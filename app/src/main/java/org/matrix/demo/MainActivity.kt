@@ -485,8 +485,6 @@ private fun markerHitsCard(hits: JSONArray?): (@Composable () -> Unit)? {
     }
 }
 
-// Mount reconciliation: kernel stat ground truth vs mountinfo. The one mount check
-// that survives kernel-side mountinfo filtering (KSU mount_hide et al.).
 /** Linker state as dl_iterate_phdr reports it: the ledger identity, the soinfo allocation
  *  sequence, and the reconciliation of the linker's own PT_LOAD extents against
  *  /proc/self/maps. Rendered for the isolated probes, which carry the same document as the
@@ -547,6 +545,8 @@ private fun linkerCard(d: JSONObject?): (@Composable () -> Unit)? {
     }
 }
 
+// Mount reconciliation: kernel stat ground truth vs mountinfo. The one mount check
+// that survives kernel-side mountinfo filtering (KSU mount_hide et al.).
 private fun reconcileCard(recon: JSONObject?): (@Composable () -> Unit)? {
     if (recon == null) return null
     val hidden = recon.optInt("hidden")

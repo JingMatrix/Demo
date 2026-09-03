@@ -208,7 +208,7 @@ constexpr uint32_t ElfImage::calculateGnuHash(std::string_view name) {
  * This function provides a convenient, unified interface for finding both data
  * variables and functions. It intelligently handles the type casting to ensure
  * that it always returns a usable pointer, saving the developer from needing
-- * different functions for different symbol types.
+ * different functions for different symbol types.
  *
  * It uses compile-time checks (`if constexpr`) to differentiate between function pointers
  * and all other types (including data pointers). This ensures that function pointers

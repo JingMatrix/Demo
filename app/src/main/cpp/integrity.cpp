@@ -86,7 +86,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
             "every library in the linker's list has a real path on disk");
     }
 
-    // 2. anonymous executable mapping shadowing a file (from /proc/self/maps)
+    // 2. executable mapping no file backs, over /proc/self/maps: an ELF image at a
+    //    non-absolute path, a shared /dev/zero map, an inode that disagrees with the
+    //    file named, or a second mapping wearing an ART JIT-cache name
     std::optional<VirtualMap::MapInfo> vm = VirtualMap::DetectInjection();
     if (vm) {
         any = true;

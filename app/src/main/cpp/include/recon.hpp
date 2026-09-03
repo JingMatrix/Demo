@@ -22,8 +22,9 @@ namespace Recon {
 
 struct Result {
   int hidden;      // mounts the kernel confirms but mountinfo hides (HIGH signal)
-  int structural;  // mountinfo tree anomalies from record erasure (orphans)
-  std::string json; // JSON object: {"hidden":N,"structural":N,"findings":[...]}
+  int structural;  // mountinfo tree anomalies from record erasure: an orphaned
+                   // mount, or a peer-group id missing from the run
+  std::string json; // {"hidden":N,"structural":N,"findings":[...],"probes":[...]}
 };
 
 // Reconcile /proc/self/mountinfo against kernel stat ground truth in the CURRENT

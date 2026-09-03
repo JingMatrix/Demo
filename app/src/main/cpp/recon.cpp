@@ -13,15 +13,6 @@
 #include <unistd.h>
 #include <vector>
 
-// This file is linked into libmain (native probe) as well, which has no LOG*.
-// Fall back to no-ops when logging.h's macros are absent.
-#ifndef LOGD
-#define LOGD(...)
-#endif
-#ifndef LOGI
-#define LOGI(...)
-#endif
-
 namespace Recon {
 namespace {
 
@@ -76,10 +67,12 @@ struct MRec {
 };
 
 struct Finding {
+  // The hidden/structural split is carried here, not by `high`: to_json counts a
+  // finding as hidden iff its check is "mount-reconciliation".
   const char *check; // "mount-reconciliation" | "mount-structure"
   std::string path;
   std::string detail;
-  bool high; // true => confirmed hidden mount; false => structural anomaly
+  bool high; // reported severity; every finding this file raises is high-signal
 };
 
 // Parse /proc/self/mountinfo. Field layout (kernel proc.rst):

@@ -403,8 +403,9 @@ final class ProcScanner {
         return line;
     }
 
-    /** Data dirs that Android covers with a per-process isolation tmpfs. Prefix-matched, so
-     *  "/data/user" also covers "/data/user_de" and "/data/user/<n>". */
+    /** Data dirs that Android covers with a per-process isolation tmpfs. Matched by whole
+     *  path segment, so "/data/user" covers "/data/user/<n>" but NOT "/data/user_de" --
+     *  every sibling dir needs its own entry below. */
     // A bare tmpfs the platform stacks over a per-app / per-user data dir to blind a
     // process to data it may not read. Which dirs are covered depends on the process.
     private static final String[] DATA_ISOLATION_POINTS = {
@@ -483,7 +484,7 @@ final class ProcScanner {
     // analyses
     // ------------------------------------------------------------------
 
-    /** All HIGH/MEDIUM/LOW hits flattened, deduped by (pid,file,label). */
+    /** Every marker hit flattened, deduped by (pid, file, label, field). */
     private static JSONArray markerSummary(List<Proc> procs) throws JSONException {
         JSONArray arr = new JSONArray();
         TreeSet<String> seen = new TreeSet<>();
