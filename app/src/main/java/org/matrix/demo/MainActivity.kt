@@ -157,6 +157,8 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+
+         KeyStoreTestRunner().runAllTests()
     }
 
     override fun onDestroy() {
