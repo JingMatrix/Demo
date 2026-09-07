@@ -22,8 +22,8 @@ jobs:
     - name: Build with Gradle
       run: ./gradlew app:assembleRelease
         
-    - name: Rename signed apk
-      run: mv app/build/outputs/apk/release/app-release-unsigned.apk app/build/outputs/apk/release/Demo.apk
+    - name: Rename apk
+      run: mv app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/Demo.apk
 
     - uses: noriban/sign-android-release@master
       name: Sign app APK
