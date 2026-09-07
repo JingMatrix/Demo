@@ -806,7 +806,7 @@ final class ProcScanner {
                 reasons.add(hidden + " mount(s) hidden from mountinfo but confirmed by the kernel (statx/statfs)");
             }
             if (structural > 0) {
-                reasons.add(structural + " mountinfo tree anomaly(ies): orphaned mount or peer-group gap from an erased record");
+                reasons.add(structural + " mountinfo tree anomaly(ies): orphaned mount, peer-group gap, or an anonymous device minor with no mount here");
             }
         }
 

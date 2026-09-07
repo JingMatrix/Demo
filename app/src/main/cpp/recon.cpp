@@ -5,10 +5,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
+#include <map>
 #include <set>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 #include <vector>
@@ -59,17 +62,20 @@ bool is_real_fs(unsigned long t) {
 struct MRec {
   int id = 0;
   int parent = 0;
+  int maj = -1;   // field 3 of mountinfo: the superblock's dev_t...
+  int min = -1;   // ...maj 0 means an anonymous dev from get_anon_bdev()
   int master = 0; // peer group this mount is a slave of (0 = none), from master:N
   int shared = 0; // peer group this mount shares (0 = none), from shared:N
   std::string root;
   std::string target;
   std::string type;
+  std::string super; // field 11: fs-specific superblock options, for lowerdir=
 };
 
 struct Finding {
   // The hidden/structural split is carried here, not by `high`: to_json counts a
   // finding as hidden iff its check is "mount-reconciliation".
-  const char *check; // "mount-reconciliation" | "mount-structure"
+  const char *check; // "mount-reconciliation" | "mount-structure" | "mount-anon-dev"
   std::string path;
   std::string detail;
   bool high; // reported severity; every finding this file raises is high-signal
@@ -89,9 +95,9 @@ std::vector<MRec> parse_self_mountinfo() {
     MRec r;
     char root[4096] = {};
     char target[4096] = {};
-    int consumed =
-        sscanf(line, "%d %d %*d:%*d %4095s %4095s", &r.id, &r.parent, root, target);
-    if (consumed < 4)
+    int consumed = sscanf(line, "%d %d %d:%d %4095s %4095s", &r.id, &r.parent,
+                          &r.maj, &r.min, root, target);
+    if (consumed < 6)
       continue;
     r.root = root;
     r.target = target;
@@ -100,8 +106,15 @@ std::vector<MRec> parse_self_mountinfo() {
     char *dash = strstr(line, " - ");
     if (dash) {
       char type[128] = {};
-      if (sscanf(dash + 3, "%127s", type) == 1)
+      char source[4096] = {};
+      char super[4096] = {};
+      // type, source, then the fs-specific options. The kernel escapes spaces in
+      // all three as \040, so %s stops on the real field boundary.
+      int got = sscanf(dash + 3, "%127s %4095s %4095s", type, source, super);
+      if (got >= 1)
         r.type = type;
+      if (got >= 3)
+        r.super = super;
       for (char *p = line; p < dash; ++p) {
         if (strncmp(p, "master:", 7) == 0)
           r.master = atoi(p + 7);
@@ -207,8 +220,415 @@ bool is_diag_target(const std::string &p) {
   return p == "/system/etc/hosts";
 }
 
-void collect(std::vector<Finding> &findings, std::string &diag) {
+// ---- anonymous block-device minors -----------------------------------------
+// Filesystems with no real block device -- tmpfs, fuse, proc, sysfs, cgroup,
+// functionfs, incremental-fs -- draw their dev_t from ONE kernel-global pool:
+// fs/super.c get_anon_bdev() calls ida_alloc_range(&unnamed_dev_ida, 1, ...),
+// which returns the LOWEST free id, and the id is held for the superblock's whole
+// lifetime, released only by kill_anon_super() -> free_anon_bdev().
+//
+// Two consequences, and together they are the check. The live set is dense from
+// below, so a minor missing from OUR mountinfo is not a free slot: it is a
+// superblock that is alive but invisible from here. And the pool is global to the
+// kernel rather than per namespace -- a private mount namespace hides the MOUNT,
+// never the superblock -- so a root daemon keeping a tmpfs in a namespace of its
+// own still spends a minor and still leaves the hole, with no cooperation from
+// mountinfo at all. (Bind mounts share a superblock and allocate nothing, so a
+// hide built purely from binds does not surface here; it is the worker tmpfs or
+// overlay that leaks.)
+
+// A path's anonymous-device minor, straight from the kernel. Like the statx probe
+// above, stat() does not travel the mountinfo seq_file path that a hider filters,
+// so the window's endpoints cannot be moved by editing the mount table.
+bool stat_anon_minor(const char *path, int &out) {
+  struct stat st;
+  if (stat(path, &st) != 0)
+    return false;
+  if (major(st.st_dev) != 0)
+    return false; // backed by a real block device: not from the anon pool
+  out = static_cast<int>(minor(st.st_dev));
+  return true;
+}
+
+// This process's package name, from argv[0] of /proc/self/cmdline. Used only to
+// reach the app's own external-storage directory, which every app may stat
+// without holding a storage permission.
+std::string self_package() {
+  char buf[256] = {};
+  FILE *fp = fopen("/proc/self/cmdline", "re");
+  if (!fp)
+    return {};
+  size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+  fclose(fp);
+  if (n == 0)
+    return {};
+  std::string s(buf); // cmdline is NUL-separated; this takes argv[0]
+  if (auto colon = s.find(':'); colon != std::string::npos)
+    s.resize(colon); // "pkg:probe" -> "pkg"
+  return s;
+}
+
+// installd hands every app PROCESS its own tmpfs for /data/data, /data/user,
+// /data/user_de and the two profile dirs. They are allocated and freed as apps
+// come and go, and the ones belonging to other apps are invisible here by design
+// -- noise for the peer-group run and the anonymous-device run alike, so both
+// exclude them. (Their children are binds onto userdata, major 254, and never
+// enter the anonymous pool at all.)
+bool is_app_private(const MRec &r, const std::string &pkg) {
+  return r.target.rfind("/data/data", 0) == 0 ||
+         r.target.rfind("/data/user", 0) == 0 ||
+         r.target.rfind("/data/misc/profiles", 0) == 0 ||
+         // Only match the root against a package-shaped name: in the native
+         // probe argv[0] is a process name, and a short generic token would
+         // match roots that have nothing to do with this app.
+         (pkg.find('.') != std::string::npos &&
+          r.root.find(pkg) != std::string::npos);
+}
+
+// The window to scan. Both endpoints come from stat(), never from mountinfo.
+//
+// FLOOR. Minor order is not boot order once anything has been freed. AOSP's first
+// stage (system/core/init/first_stage_init.cpp) mounts /dev, /dev/pts, /proc,
+// /sys, /mnt, /debug_ramdisk and /second_stage_resources and then loads kernel
+// modules; second stage (init.cpp SecondStageMain) umounts /debug_ramdisk and
+// /second_stage_resources and only afterwards calls MountExtraFilesystems(),
+// whose /apex and /bootstrap-apex land in those two RECYCLED minors. So a
+// pseudo-filesystem that a module loaded in between pinned with simple_pin_fs()
+// -- drm_fs_inode_new() is the usual one -- keeps its minor for good while
+// appearing in no mountinfo on the device, and that stretch legitimately contains
+// holes. Everything below the floor is therefore out of scope.
+//
+// /tmp (init.rc, "on early-init") is the first mount past that whole window that
+// an app can also stat. /linkerconfig would do on timing but is denied to
+// untrusted_app, so its minor is readable only from mountinfo -- the very text
+// this check exists to distrust. /tmp is Android 15+; /dev/cpuset and
+// /sys/fs/cgroup come from CgroupSetup(), which also runs after
+// MountExtraFilesystems(), and cover the older releases.
+//
+// CEILING. The fuse superblock behind /storage/emulated, which is created once at
+// user start and so sits above every boot-time mount. It is an upper bound, not
+// the end of the scan: the per-app churn region can reach BELOW it (this app's own
+// tmpfs were seen at 0:131..135 with the fuse sb at 0:206), which is why the scan
+// set also drops app-private mounts and then only reports INTERIOR holes. What is
+// actually checked is the run of boot-era minors, and it ends at the last one this
+// namespace can see.
+bool anon_window(int &floor, std::string &floor_path, int &ceil,
+                 std::string &ceil_path) {
+  static const char *kFloors[] = {"/tmp", "/dev/cpuset", "/sys/fs/cgroup"};
+  bool have_floor = false;
+  for (const char *p : kFloors) {
+    int m = 0;
+    if (!stat_anon_minor(p, m))
+      continue;
+    if (!have_floor || m > floor) {
+      floor = m;
+      floor_path = p;
+      have_floor = true;
+    }
+  }
+  if (!have_floor)
+    return false;
+
+  std::vector<std::string> ceilings = {
+      "/storage/emulated/0/Android/data/.nomedia",
+      "/storage/emulated/0/Android/obb/.nomedia"};
+  if (std::string own = self_package(); !own.empty())
+    ceilings.push_back("/storage/emulated/0/Android/data/" + own);
+  ceilings.push_back("/storage/emulated/0");
+  ceilings.push_back("/storage/emulated");
+  for (const std::string &p : ceilings) {
+    int m = 0;
+    if (stat_anon_minor(p.c_str(), m)) {
+      ceil = m;
+      ceil_path = p;
+      return ceil > floor;
+    }
+  }
+  // No external storage in this namespace: an isolated process sees none, so the
+  // check simply does not run there rather than guessing a ceiling.
+  return false;
+}
+
+// At most this many hole findings; a run of missing minors is one finding, and
+// past a handful the report says nothing more than the first few already did.
+constexpr int kMaxAnonHoles = 4;
+
+// A run longer than this is REPORTED but not COUNTED as a detection. A hider
+// spends one anonymous minor per worker superblock it keeps alive outside our
+// namespace -- one to a few. A long run is the signature of something we simply
+// cannot see into: the per-app tmpfs churn region, where the zygote takes five
+// minors per app process (isolateAppData / isolateJitProfile), all of them in
+// other namespaces. The floor and the app-private filter already keep that region
+// out of the set in the cases we know about; this is the backstop for the ones we
+// do not, so an unfamiliar device shape degrades to a low-confidence note instead
+// of a false accusation.
+constexpr int kWideAnonRun = 10;
+
+// ---- overlayfs pseudo-devices ----------------------------------------------
+// The lowest-free-first argument above has one large exception, and on a stock
+// device it is the ONLY thing that makes the window look holed.
+//
+// overlayfs does not just spend a minor on its own superblock. fs/overlayfs
+// ovl_get_layers() -> ovl_get_fsid() calls get_anon_bdev() once per DISTINCT
+// lower filesystem, plus once for the fsid-0 slot the code reserves for an upper
+// layer even on a lower-only (read-only) overlay. Those extra dev_t values are
+// pseudo_dev: ovl_map_dev_ino() reports them as st_dev for files served from that
+// layer, so that inode numbers stay unique across layers. They back no superblock
+// and therefore appear in NO mountinfo, in any namespace, on any device.
+//
+// A ColorOS/OxygenOS build stacks /product/app, /product/priv-app, /product/lib,
+// /product/lib64 on seven lower dirs each (/my_region, /my_preload, /my_product,
+// /my_heytap, /my_stock, /my_engineering, /product) -- eight invisible minors
+// apiece, four times over, all inside the window. That is a clean device with no
+// modules loaded, and the check called every one of those runs a hidden mount.
+//
+// So the pseudo-devices have to be accounted for before a hole means anything.
+// Two independent sources, both used:
+//
+//  (a) OBSERVED, from the kernel. stat() an entry inside the overlay and st_dev
+//      IS the pseudo_dev of the layer that entry came from. No mountinfo text is
+//      involved, so this half cannot be forged by editing the mount table.
+//  (b) CLAIMED, from the lowerdir= option, bounded by statfs(): the run right
+//      after the overlay's own minor, one per lower layer plus the reserved slot.
+//      Needed because a layer with nothing at the mount's top level never shows
+//      up under (a). This half is text a hider could inflate to buy itself a
+//      window, which is why the credit is granted only where statfs confirms
+//      from the kernel that the mount really is overlayfs, only for the minors
+//      immediately following it, and only up to kMaxOverlayLayers.
+
+// A hider cannot mint layers without bound; past this many the credit stops and
+// the surplus is reported as an ordinary hole.
+constexpr int kMaxOverlayLayers = 16;
+
+// Entries to stat per overlay when observing pseudo-devices. Enough to reach
+// several layers of a merged directory without turning the check into a walk.
+constexpr int kOverlayProbeEntries = 48;
+
+// Lower layers this overlay claims, deduplicated by the kernel where it can be:
+// two lowerdirs on the same superblock share one pseudo_dev, so stat them and
+// count distinct st_dev. Paths an app cannot stat (/my_stock and friends are
+// usually unreadable to untrusted_app) fall back to counting the strings, which
+// can only over-count -- never under-count -- the minors overlayfs spent.
+int overlay_lower_layers(const MRec &r) {
+  auto pos = r.super.find("lowerdir=");
+  if (pos == std::string::npos)
+    return 0;
+  pos += 9;
+  auto end = r.super.find(',', pos);
+  std::string list = r.super.substr(pos, end == std::string::npos
+                                             ? std::string::npos
+                                             : end - pos);
+  std::set<dev_t> devs;
+  int unstatable = 0;
+  size_t at = 0;
+  while (at <= list.size()) {
+    auto colon = list.find(':', at);
+    std::string one = list.substr(at, colon == std::string::npos
+                                          ? std::string::npos
+                                          : colon - at);
+    if (!one.empty()) {
+      struct stat st;
+      if (stat(one.c_str(), &st) == 0)
+        devs.insert(st.st_dev);
+      else
+        ++unstatable;
+    }
+    if (colon == std::string::npos)
+      break;
+    at = colon + 1;
+  }
+  return static_cast<int>(devs.size()) + unstatable;
+}
+
+// Pseudo-devices this overlay is actually using, straight from the kernel: every
+// distinct anonymous minor a file inside the mount reports that is not the
+// overlay's own superblock minor.
+void observe_overlay_pseudo(const MRec &r, std::set<int> &out) {
+  DIR *d = opendir(r.target.c_str());
+  if (!d)
+    return;
+  int probed = 0;
+  while (struct dirent *e = readdir(d)) {
+    if (e->d_name[0] == '.' &&
+        (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+      continue;
+    if (++probed > kOverlayProbeEntries)
+      break;
+    struct stat st;
+    if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+      continue;
+    if (major(st.st_dev) != 0 || static_cast<int>(minor(st.st_dev)) == r.min)
+      continue;
+    out.insert(static_cast<int>(minor(st.st_dev)));
+  }
+  closedir(d);
+}
+
+// Every minor in the window that overlayfs -- not a hidden mount -- accounts for.
+// Maps the minor to the overlay that owns it, so the report can say so.
+void overlay_pseudo_devs(const std::vector<MRec> &recs, int floor, int ceil,
+                         std::map<int, std::string> &claimed) {
+  for (const MRec &r : recs) {
+    if (r.type != "overlay" || r.maj != 0 || r.min <= floor || r.min >= ceil)
+      continue;
+    // Kernel ground truth that this really is an overlay superblock; a forged
+    // mountinfo line describing a fake overlay earns no credit.
+    if (statfs_magic(r.target.c_str()) != kOverlayfs)
+      continue;
+
+    // Bounded to the overlay's own run: a bind mount grafted onto an entry INSIDE
+    // the overlay would also report a foreign st_dev here, and that is exactly the
+    // kind of minor this check exists to find -- it must not be able to pay for
+    // itself. Layer pseudo-devices are allocated with the superblock, so they sit
+    // directly above it.
+    std::set<int> observed;
+    observe_overlay_pseudo(r, observed);
+    for (int m : observed)
+      if (m > r.min && m <= r.min + kMaxOverlayLayers + 1 && m < ceil)
+        claimed.emplace(m, r.target + " (overlay layer, observed)");
+
+    int layers = overlay_lower_layers(r);
+    if (layers <= 0)
+      continue;
+    if (layers > kMaxOverlayLayers) {
+      LOGI("recon: %s claims %d lower layers, crediting only %d",
+           r.target.c_str(), layers, kMaxOverlayLayers);
+      layers = kMaxOverlayLayers;
+    }
+    // +1 for the fsid-0 slot overlayfs reserves even with no upper layer.
+    for (int m = r.min + 1; m <= r.min + layers + 1 && m < ceil; ++m)
+      claimed.emplace(m, r.target + " (overlay layer)");
+  }
+}
+
+void anon_dev_gaps(const std::vector<MRec> &recs, const std::string &pkg,
+                   std::vector<Finding> &findings, std::string &window) {
+  int floor = 0, ceil = 0;
+  std::string floor_path, ceil_path;
+  if (!anon_window(floor, floor_path, ceil, ceil_path)) {
+    LOGD("recon: anon-dev window unavailable (no floor or no storage), skipping");
+    return;
+  }
+
+  // Visible minors in the window, each with the mount that owns it, so a hole is
+  // reported with the neighbours it sits between: position is what separates a
+  // daemon's private tmpfs from an ordinary boot-time mount.
+  std::map<int, std::string> present;
+  for (const MRec &r : recs) {
+    if (r.maj != 0 || r.min <= floor || r.min >= ceil)
+      continue;
+    if (is_app_private(r, pkg))
+      continue;
+    present.emplace(r.min, r.target);
+  }
+
+  // Minors spent by overlayfs on layer pseudo-devices. These are allocated out
+  // of the same pool and are absent from every mountinfo by design, so they must
+  // come off the window before a gap can be read as a hidden superblock.
+  std::map<int, std::string> claimed;
+  overlay_pseudo_devs(recs, floor, ceil, claimed);
+
+  int holes = 0;    // counted: runs short enough to be a hidden mount
+  int wide = 0;     // reported only: runs too long to attribute
+  int credited = 0; // minors an overlay's layers account for
+  if (present.size() >= 2) {
+    // Emit one finding per run of minors that nothing accounts for, named with
+    // the visible mounts it sits between: position is what separates a daemon's
+    // private tmpfs from an ordinary boot-time mount.
+    auto emit = [&](int lo, int hi, const std::string &below,
+                    const std::string &below_target, const std::string &above,
+                    const std::string &above_target) {
+      const int len = hi - lo + 1;
+      const bool too_wide = len > kWideAnonRun;
+      // A single minor immediately past an overlay's layer block is where our
+      // arithmetic is least certain, not where a hider is: two lowerdirs may
+      // share a superblock and one pseudo_dev in ways we cannot see from here,
+      // and the number of slots overlayfs reserves beyond the layers themselves
+      // has moved between kernel versions. One minor of slack at that boundary
+      // is measurement error. It is still listed; it just does not accuse.
+      const bool slack = len == 1 && claimed.count(lo - 1) > 0;
+      std::string range =
+          (len == 1) ? std::to_string(lo)
+                     : std::to_string(lo) + "-" + std::to_string(hi);
+      std::string detail =
+          "anonymous device minor " + range +
+          " is allocated but no mount in this namespace uses it, and no "
+          "overlayfs layer accounts for it -- the kernel hands these out "
+          "lowest-free-first, so it is a live superblock hidden from this view "
+          "(between 0:" + below + " " + below_target + " and 0:" + above + " " +
+          above_target + ")";
+      if (too_wide)
+        detail += "; a run of " + std::to_string(len) +
+                  " is far wider than the one or two superblocks a hidden "
+                  "mount costs and matches per-app tmpfs churn (5 minors per "
+                  "app process), so this is listed but not counted";
+      else if (slack)
+        detail += "; it sits one past the layer block of " + below_target +
+                  ", within the slack of the layer arithmetic, so this is "
+                  "listed but not counted";
+      findings.push_back({"mount-anon-dev", "anon-dev:" + range, detail,
+                          !too_wide && !slack});
+      LOGI("recon: anon dev minor(s) %s missing between %s and %s%s",
+           range.c_str(), below_target.c_str(), above_target.c_str(),
+           too_wide    ? " (too wide to attribute, not counted)"
+           : slack     ? " (overlay boundary slack, not counted)"
+                       : "");
+      if (too_wide || slack)
+        ++wide;
+      else
+        ++holes;
+    };
+
+    int expected = present.begin()->first;
+    // What sits immediately below the minor being examined: a visible mount, or
+    // the overlay whose layer took the last credited minor.
+    std::string below = present.begin()->second;
+    for (const auto &entry : present) {
+      const int m = entry.first;
+      int run = -1; // start of the current unaccounted-for run, -1 = none
+      for (int x = expected; x < m && holes + wide < kMaxAnonHoles; ++x) {
+        auto it = claimed.find(x);
+        if (it == claimed.end()) {
+          if (run < 0)
+            run = x;
+          continue;
+        }
+        ++credited;
+        if (run >= 0) {
+          emit(run, x - 1, std::to_string(run - 1), below, std::to_string(x),
+               it->second);
+          run = -1;
+        }
+        below = it->second;
+      }
+      if (run >= 0 && holes + wide < kMaxAnonHoles)
+        emit(run, m - 1, std::to_string(run - 1), below, std::to_string(m),
+             entry.second);
+      if (holes + wide >= kMaxAnonHoles)
+        break;
+      expected = m + 1;
+      below = entry.second;
+    }
+  }
+
+  LOGD("recon: anon-dev window %s 0:%d .. %s 0:%d, %zu visible, %zu credited to "
+       "overlay layers, %d hole(s), %d wide run(s)",
+       floor_path.c_str(), floor, ceil_path.c_str(), ceil, present.size(),
+       claimed.size(), holes, wide);
+
+  window = "{\"floor\":" + std::to_string(floor) + ",\"floorPath\":\"" +
+           jesc(floor_path) + "\",\"ceil\":" + std::to_string(ceil) +
+           ",\"ceilPath\":\"" + jesc(ceil_path) +
+           "\",\"visible\":" + std::to_string(present.size()) +
+           ",\"overlayPseudo\":" + std::to_string(credited) +
+           ",\"holes\":" + std::to_string(holes) + ",\"wide\":" +
+           std::to_string(wide) + "}";
+}
+
+void collect(std::vector<Finding> &findings, std::string &diag,
+             std::string &window) {
   std::vector<MRec> recs = parse_self_mountinfo();
+  const std::string pkg = self_package();
 
   // Index by mount id and by target path.
   std::set<int> ids;
@@ -245,9 +665,7 @@ void collect(std::vector<Finding> &findings, std::string &diag) {
     std::set<int> groups;
     for (const MRec &r : recs) {
       // Skip app-private mounts, whose peer groups need not join the global run.
-      if (r.target.rfind("/data/data", 0) == 0 ||
-          r.target.rfind("/data/user", 0) == 0 ||
-          r.root.find("org.matrix.demo") != std::string::npos)
+      if (is_app_private(r, pkg))
         continue;
       if (r.shared > 0)
         groups.insert(r.shared);
@@ -274,6 +692,11 @@ void collect(std::vector<Finding> &findings, std::string &diag) {
       expected = g + 1;
     }
   }
+
+  // --- anonymous-device continuity: the only check here that sees mounts living
+  // outside this namespace entirely, because the dev_t pool they draw from is
+  // kernel-global while the mount table is not.
+  anon_dev_gaps(recs, pkg, findings, window);
 
   // --- reconciliation: kernel stat vs mountinfo text.
   std::vector<std::string> probes;
@@ -328,13 +751,18 @@ void collect(std::vector<Finding> &findings, std::string &diag) {
 }
 
 std::string to_json(const std::vector<Finding> &findings, const std::string &diag,
-                    int &hidden, int &structural) {
+                    const std::string &window, int &hidden, int &structural) {
   hidden = 0;
   structural = 0;
   std::string arr;
   bool first = true;
   for (const Finding &f : findings) {
-    if (strcmp(f.check, "mount-reconciliation") == 0)
+    // A finding raised at "med" is evidence too weak to accuse on: it goes into
+    // the findings array and the report table, but drives neither counter, so it
+    // cannot on its own turn the verdict to DETECTED.
+    if (!f.high)
+      ;
+    else if (strcmp(f.check, "mount-reconciliation") == 0)
       hidden++;
     else
       structural++;
@@ -353,7 +781,8 @@ std::string to_json(const std::vector<Finding> &findings, const std::string &dia
   }
   std::string json = "{\"hidden\":" + std::to_string(hidden) +
                      ",\"structural\":" + std::to_string(structural) +
-                     ",\"findings\":[" + arr + "],\"probes\":[" + diag + "]}";
+                     ",\"findings\":[" + arr + "],\"probes\":[" + diag +
+                     "],\"anonDev\":" + (window.empty() ? "null" : window) + "}";
   return json;
 }
 
@@ -361,10 +790,10 @@ std::string to_json(const std::vector<Finding> &findings, const std::string &dia
 
 Result Run() {
   std::vector<Finding> findings;
-  std::string diag;
-  collect(findings, diag);
+  std::string diag, window;
+  collect(findings, diag, window);
   Result r;
-  r.json = to_json(findings, diag, r.hidden, r.structural);
+  r.json = to_json(findings, diag, window, r.hidden, r.structural);
   return r;
 }
 
