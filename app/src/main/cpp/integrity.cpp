@@ -205,9 +205,9 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_matrix_demo_MainActivity_runIntegr
     if (rc.structural > 0) {
         any = true;
         add(arr, first, "mount", "Mount structure", true,
-            std::to_string(rc.structural) + " tree anomaly(ies): orphaned mount or peer-group gap from an erased record");
+            std::to_string(rc.structural) + " tree anomaly(ies): orphaned mount, peer-group gap, or an anonymous device minor with no mount here");
     } else {
-        add(arr, first, "mount", "Mount structure", false, "mountinfo tree and peer groups are internally consistent");
+        add(arr, first, "mount", "Mount structure", false, "mountinfo tree, peer groups and anonymous device minors are internally consistent");
     }
 
     // raw toolkit log captured during the checks -> "log" array

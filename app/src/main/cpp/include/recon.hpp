@@ -10,10 +10,18 @@
 // MOUNT_ROOT and statfs f_type -- what is REALLY mounted at a set of probe paths,
 // and report every mount the kernel confirms but mountinfo omits.
 //
+// A third check needs neither the text nor a reachable path: every filesystem
+// without a block device draws its dev_t from one kernel-GLOBAL pool, handed out
+// lowest-free-first (fs/super.c get_anon_bdev), so a minor missing from our
+// mountinfo is a superblock that is alive but invisible here -- including one
+// mounted only in some daemon's private mount namespace, which no per-namespace
+// check can reach.
+//
 // The same core runs in the app's main process (libdemo / integrity.cpp), the
 // native isolated probe (libmain / probe.cpp), and the classic isolated Java
 // probe (ProcScanner, via the JNI entry point) so detection is identical in all
-// three contexts.
+// three contexts. The anonymous-device check needs external storage to fix its
+// upper bound, so it is skipped (not failed) in the isolated probes.
 
 #include <cstddef>
 #include <string>
@@ -23,8 +31,13 @@ namespace Recon {
 struct Result {
   int hidden;      // mounts the kernel confirms but mountinfo hides (HIGH signal)
   int structural;  // mountinfo tree anomalies from record erasure: an orphaned
-                   // mount, or a peer-group id missing from the run
-  std::string json; // {"hidden":N,"structural":N,"findings":[...],"probes":[...]}
+                   // mount, a peer-group id missing from the run, or an
+                   // anonymous device minor no mount here accounts for.
+                   // Counts only "high" findings -- a low-confidence one is
+                   // listed in the JSON but never moves the verdict.
+  std::string json; // {"hidden":N,"structural":N,"findings":[...],"probes":[...],
+                    //  "anonDev":{floor,floorPath,ceil,ceilPath,visible,
+                    //              holes,wide}|null}
 };
 
 // Reconcile /proc/self/mountinfo against kernel stat ground truth in the CURRENT

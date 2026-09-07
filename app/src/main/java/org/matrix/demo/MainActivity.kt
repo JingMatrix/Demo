@@ -598,6 +598,33 @@ private fun reconcileCard(recon: JSONObject?): (@Composable () -> Unit)? {
                 }
                 MonoBlock(monoTable(listOf("path", "exist", "mnt", "fs", "in-mi"), prows))
             }
+            // Anonymous device minors: the window actually scanned, so a skipped
+            // check (no external storage in an isolated process) reads as skipped
+            // rather than as a clean pass.
+            val anon = recon.optJSONObject("anonDev")
+            Spacer(Modifier.height(6.dp))
+            if (anon == null) {
+                Text(
+                    "anon-dev continuity: not run (no floor mount or no external storage here)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                val holes = anon.optInt("holes")
+                val wide = anon.optInt("wide")
+                val wideNote = if (wide > 0) ", $wide wide run(s) not counted" else ""
+                Text(
+                    "anon-dev continuity: ${anon.optString("floorPath")} 0:${anon.optInt("floor")} .. " +
+                        "${anon.optString("ceilPath")} 0:${anon.optInt("ceil")} — " +
+                        "${anon.optInt("visible")} minor(s) visible, $holes hole(s)$wideNote",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = when {
+                        holes > 0 -> MaterialTheme.colorScheme.error
+                        wide > 0 -> MaterialTheme.colorScheme.onSurfaceVariant
+                        else -> Good
+                    },
+                )
+            }
         }
     }
 }
