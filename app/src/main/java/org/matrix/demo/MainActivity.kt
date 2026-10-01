@@ -83,8 +83,10 @@ class MainActivity : ComponentActivity() {
 
     private var classicResult by mutableStateOf<JSONObject?>(null)
     private var nativeResult by mutableStateOf<JSONObject?>(null)
+    private var sepolicyResult by mutableStateOf<JSONObject?>(null)
     private var classicDone by mutableStateOf(false)
     private var nativeDone by mutableStateOf(false)
+    private var sepolicyDone by mutableStateOf(false)
     private var integrityResult by mutableStateOf<JSONObject?>(null)
 
     private val handler = Handler(Looper.getMainLooper())
@@ -92,17 +94,26 @@ class MainActivity : ComponentActivity() {
     // Main-process native integrity checks (injection / mount tamper), libdemo.so.
     private external fun runIntegrityChecks(): String
 
-    private inner class Conn(val tag: String, val isNative: Boolean) : ServiceConnection {
+    // Which of the three probes a Conn/bind belongs to. Each kind maps to its own
+    // result/done state pair below, so adding a probe only means adding an entry here
+    // plus one `when` branch each in onServiceConnected's assignment and in mark().
+    private enum class Probe { CLASSIC, NATIVE, SEPOLICY }
+
+    private inner class Conn(val tag: String, val kind: Probe) : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             try {
                 val raw = IDemoProbeService.Stub.asInterface(binder).getResult()
                 Log.i(ProcScanner.TAG, "$tag raw report ${raw.length} bytes")
                 val o = JSONObject(raw)
-                if (isNative) nativeResult = o else classicResult = o
+                when (kind) {
+                    Probe.CLASSIC -> classicResult = o
+                    Probe.NATIVE -> nativeResult = o
+                    Probe.SEPOLICY -> sepolicyResult = o
+                }
             } catch (e: Exception) {
                 Log.e(ProcScanner.TAG, "$tag failed", e)
             } finally {
-                mark(isNative)
+                mark(kind)
                 runCatching { unbindService(this) }
             }
         }
@@ -111,28 +122,34 @@ class MainActivity : ComponentActivity() {
 
         override fun onNullBinding(name: ComponentName) {
             Log.w(ProcScanner.TAG, "$tag null binding (service returned null)")
-            mark(isNative)
+            mark(kind)
             runCatching { unbindService(this) }
         }
     }
 
-    private fun mark(isNative: Boolean) {
-        if (isNative) nativeDone = true else classicDone = true
+    private fun mark(kind: Probe) {
+        when (kind) {
+            Probe.CLASSIC -> classicDone = true
+            Probe.NATIVE -> nativeDone = true
+            Probe.SEPOLICY -> sepolicyDone = true
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        bind(Intent(this, DemoProbeService::class.java), Conn("classic", false))
-        bind(Intent(this, NativeProbeService::class.java), Conn("native", true))
+        bind(Intent(this, DemoProbeService::class.java), Conn("classic", Probe.CLASSIC))
+        bind(Intent(this, NativeProbeService::class.java), Conn("native", Probe.NATIVE))
+        bindSepolicy(Conn("sepolicy", Probe.SEPOLICY))
 
         // safety net: mark everything done after 8s even if a bind hung
         handler.postDelayed({
-            if (!(classicDone && nativeDone)) {
+            if (!(classicDone && nativeDone && sepolicyDone)) {
                 Log.w(ProcScanner.TAG, "timeout; rendering partial")
                 classicDone = true
                 nativeDone = true
+                sepolicyDone = true
             }
         }, 8000)
 
@@ -153,7 +170,8 @@ class MainActivity : ComponentActivity() {
                     integrity = integrityResult,
                     classic = classicResult,
                     nativeR = nativeResult,
-                    loading = !(classicDone && nativeDone),
+                    sepolicyR = sepolicyResult,
+                    loading = !(classicDone && nativeDone && sepolicyDone),
                 )
             }
         }
@@ -170,11 +188,28 @@ class MainActivity : ComponentActivity() {
         try {
             if (!bindService(intent, conn, Context.BIND_AUTO_CREATE)) {
                 Log.w(ProcScanner.TAG, "${conn.tag} bindService returned false")
-                mark(conn.isNative)
+                mark(conn.kind)
             }
         } catch (e: Exception) {
             Log.e(ProcScanner.TAG, "${conn.tag} bind threw", e)
-            mark(conn.isNative)
+            mark(conn.kind)
+        }
+    }
+
+    // SepolicyProbeService is declared with useAppZygote="true" (AndroidManifest.xml), so
+    // unlike the other two probes it must be bound through bindIsolatedService with an
+    // explicit instance name, not the plain bindService() above -- see DirtySepolicy's own
+    // MainActivity.java for the same pattern against its single service.
+    private fun bindSepolicy(conn: Conn) {
+        val intent = Intent(this, SepolicyProbeService::class.java)
+        try {
+            if (!bindIsolatedService(intent, Context.BIND_AUTO_CREATE, "sepolicy", mainExecutor, conn)) {
+                Log.w(ProcScanner.TAG, "${conn.tag} bindIsolatedService returned false")
+                mark(conn.kind)
+            }
+        } catch (e: Exception) {
+            Log.e(ProcScanner.TAG, "${conn.tag} bind threw", e)
+            mark(conn.kind)
         }
     }
 
@@ -209,7 +244,13 @@ private val Good: Color
 // ---------------------------------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DemoApp(integrity: JSONObject?, classic: JSONObject?, nativeR: JSONObject?, loading: Boolean) {
+private fun DemoApp(
+    integrity: JSONObject?,
+    classic: JSONObject?,
+    nativeR: JSONObject?,
+    sepolicyR: JSONObject?,
+    loading: Boolean,
+) {
     var tab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Report", "Logs")
 
@@ -219,7 +260,7 @@ private fun DemoApp(integrity: JSONObject?, classic: JSONObject?, nativeR: JSONO
             TopAppBar(
                 title = { Text("JingMatrix/Demo") },
                 actions = {
-                    IconButton(onClick = { exportCurrent(context, tab, integrity, classic, nativeR) }) {
+                    IconButton(onClick = { exportCurrent(context, tab, integrity, classic, nativeR, sepolicyR) }) {
                         Icon(painterResource(R.drawable.ic_save), contentDescription = "Save")
                     }
                     IconButton(onClick = {
@@ -244,15 +285,21 @@ private fun DemoApp(integrity: JSONObject?, classic: JSONObject?, nativeR: JSONO
                 }
             }
             when (tab) {
-                0 -> ReportTab(integrity, classic, nativeR, loading)
-                else -> LogsTab(integrity, classic, nativeR)
+                0 -> ReportTab(integrity, classic, nativeR, sepolicyR, loading)
+                else -> LogsTab(integrity, classic, nativeR, sepolicyR)
             }
         }
     }
 }
 
 @Composable
-private fun ReportTab(integrity: JSONObject?, classic: JSONObject?, nativeR: JSONObject?, loading: Boolean) {
+private fun ReportTab(
+    integrity: JSONObject?,
+    classic: JSONObject?,
+    nativeR: JSONObject?,
+    sepolicyR: JSONObject?,
+    loading: Boolean,
+) {
     val expanded = remember { mutableStateMapOf<String, Boolean>() }
     fun exp(k: String) = expanded[k] ?: true
     LazyColumn(
@@ -276,6 +323,9 @@ private fun ReportTab(integrity: JSONObject?, classic: JSONObject?, nativeR: JSO
                 }
             }
         }
+        if (sepolicyR != null) {
+            reportSection(sepolicyR, "sepolicy selinux", exp("sepolicy"), { toggle(expanded, "sepolicy") })
+        }
         if (classic != null) {
             reportSection(classic, "classic isolated", exp("classic"), { toggle(expanded, "classic") })
         } else if (!loading) {
@@ -287,7 +337,13 @@ private fun ReportTab(integrity: JSONObject?, classic: JSONObject?, nativeR: JSO
     }
 }
 
-private fun sectionDetected(r: JSONObject) = r.optJSONObject("verdict")?.optBoolean("detected") == true
+// null means "don't know" (no dot shown, e.g. for the Logs tab's sections). An inconclusive
+// probe run (top-level "error") is neither clean nor detected, so it reports null here too --
+// without this, a crashed/blocked probe's missing-or-false verdict would paint a false CLEAN dot.
+private fun sectionDetected(r: JSONObject): Boolean? {
+    if (r.has("error")) return null
+    return r.optJSONObject("verdict")?.optBoolean("detected") == true
+}
 
 private fun toggle(map: MutableMap<String, Boolean>, key: String) {
     map[key] = !(map[key] ?: true)
@@ -298,6 +354,7 @@ private fun LazyListScope.reportSection(r: JSONObject, label: String, expanded: 
     if (!expanded) return
     item { VerdictCard(r) }
     environmentCard(r)?.let { block -> item { block() } }
+    sepolicyCard(r.optJSONObject("sepolicy"))?.let { block -> item { block() } }
     reconcileCard(r.optJSONObject("reconcile"))?.let { block -> item { block() } }
     linkerCard(r.optJSONObject("dlphdr"))?.let { block -> item { block() } }
     markerHitsCard(r.optJSONArray("markerHits"))?.let { block -> item { block() } }
@@ -366,6 +423,36 @@ private fun integrityGroupCard(checks: JSONArray, type: String, title: String): 
 // ---------------------------------------------------------------------------
 @Composable
 private fun VerdictCard(r: JSONObject) {
+    val error = r.optString("error", "")
+    if (error.isNotEmpty()) {
+        // Distinct third state: the probe could not run to a verdict at all (SELinux
+        // disabled, unexpected context, UID mismatch, ...). Rendering this as "CLEAN"
+        // would be worse than useless -- a root solution blocking the probe would look
+        // identical to a clean device -- so it gets its own neutral color and label.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+            ),
+        ) {
+            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+                Box(
+                    Modifier.width(5.dp).fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.onSurfaceVariant),
+                )
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        "INCONCLUSIVE",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 18.sp,
+                    )
+                    BulletRow(error)
+                }
+            }
+        }
+        return
+    }
     val verdict = r.optJSONObject("verdict")
     val detected = verdict != null && verdict.optBoolean("detected")
     val reasons = verdict?.optJSONArray("reasons").toStringList()
@@ -436,6 +523,64 @@ private fun environmentCard(r: JSONObject): (@Composable () -> Unit)? {
         StageCard {
             CardTitle("Environment")
             KvGrid(items)
+        }
+    }
+}
+
+// Dirty-sepolicy probe: the SELinux status baseline plus whichever root/hook fingerprints
+// (Magisk, KernelSU, Xposed, Zygisk Implementation, AOSP su, adb_root, ...) fired. Ported from
+// LSPosed/DirtySepolicy's AppZygote.java (see README.md's "Dirty sepolicy" section).
+private fun sepolicyCard(sp: JSONObject?): (@Composable () -> Unit)? {
+    if (sp == null) return null
+    val baseline = sp.optJSONObject("baseline")
+    val findings = sp.optJSONArray("findings")
+    return {
+        StageCard {
+            CardTitle(
+                "Sepolicy baseline" +
+                    if (findings != null) "  ·  ${findings.length()} finding(s)" else "",
+            )
+            if (baseline != null) {
+                KvGrid(
+                    listOf(
+                        "enforcing" to baseline.optString("enforcing"),
+                        "deny_unknown" to baseline.optString("deny_unknown"),
+                        "sequence" to baseline.optString("sequence"),
+                        "policyload" to baseline.optString("policyload"),
+                        "avdSeqNo" to baseline.optString("avdSeqNo"),
+                        "newKernel" to baseline.optString("newKernel"),
+                    ),
+                )
+            }
+            if (findings == null || findings.length() == 0) {
+                Text(
+                    "no dirty sepolicy rules found (system_server/Magisk/KernelSU/Xposed/" +
+                        "Zygisk Implementation fingerprints all absent)",
+                    color = Good,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                Spacer(Modifier.height(6.dp))
+                for (i in 0 until findings.length()) {
+                    val f = findings.optJSONObject(i) ?: continue
+                    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                        Text(
+                            "●",
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.width(20.dp),
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(f.optString("label"), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text(
+                                f.optString("detail"),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1037,7 +1182,7 @@ private fun nativeExtrasCards(r: JSONObject, scope: LazyListScope) {
 // Logs tab
 // ---------------------------------------------------------------------------
 @Composable
-private fun LogsTab(integrity: JSONObject?, classic: JSONObject?, nativeR: JSONObject?) {
+private fun LogsTab(integrity: JSONObject?, classic: JSONObject?, nativeR: JSONObject?, sepolicyR: JSONObject?) {
     val expanded = remember { mutableStateMapOf<String, Boolean>() }
     fun exp(k: String) = expanded[k] ?: true
     LazyColumn(
@@ -1046,6 +1191,7 @@ private fun LogsTab(integrity: JSONObject?, classic: JSONObject?, nativeR: JSONO
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         logSection(integrity, "main-process integrity", exp("li"), { toggle(expanded, "li") })
+        logSection(sepolicyR, "sepolicy selinux", exp("ls"), { toggle(expanded, "ls") })
         logSection(classic, "classic isolated", exp("lc"), { toggle(expanded, "lc") })
         logSection(nativeR, "native zygote_next", exp("ln"), { toggle(expanded, "ln") })
     }
@@ -1058,6 +1204,7 @@ private fun exportCurrent(
     integrity: JSONObject?,
     classic: JSONObject?,
     nativeR: JSONObject?,
+    sepolicyR: JSONObject?,
 ) {
     val report = tab == 0
     val name = if (report) "demo-report.json" else "demo-logs.txt"
@@ -1066,6 +1213,7 @@ private fun exportCurrent(
             integrity?.let { put("integrity", it) }
             classic?.let { put("classic", it) }
             nativeR?.let { put("native", it) }
+            sepolicyR?.let { put("sepolicy", it) }
         }.toString(2)
     } else {
         buildString {
@@ -1078,6 +1226,7 @@ private fun exportCurrent(
             sec("main-process integrity", integrity)
             sec("classic isolated", classic)
             sec("native zygote_next", nativeR)
+            sec("sepolicy selinux", sepolicyR)
         }
     }
     try {

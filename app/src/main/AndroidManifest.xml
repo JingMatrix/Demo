@@ -9,7 +9,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:label="@string/app_name"
-        android:theme="@style/AppTheme">
+        android:theme="@style/AppTheme"
+        android:zygotePreloadName="org.matrix.demo.SepolicyZygote">
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -34,6 +35,15 @@
             android:name=".NativeProbeService"
             android:isolatedProcess="true"
             android:nativeService="true" />
+
+        <!-- Sepolicy probe: forked from the app zygote (android:zygotePreloadName on
+             <application> above), which must itself be able to query and check SELinux
+             access to transition into this service's restricted context: a vantage point
+             an ordinary untrusted app does not have (DirtySepolicy technique). -->
+        <service
+            android:name=".SepolicyProbeService"
+            android:isolatedProcess="true"
+            android:useAppZygote="true" />
 
         <!-- Share exported report/log files from cacheDir. -->
         <provider

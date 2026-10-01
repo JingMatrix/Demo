@@ -1,8 +1,8 @@
 # Demo
 
 An Android app that asks whether anything is being hidden from it: a library
-injected into its own address space, or a root module's mounts erased from its
-mount table.
+injected into its own address space, a root module's mounts erased from its
+mount table, or a dirty SELinux policy a root solution left behind.
 
 It is one half of a pair. The other is
 [NeoZygisk](https://github.com/JingMatrix/NeoZygisk), which sets out to close
@@ -141,9 +141,21 @@ Two services look from where an ordinary app cannot:
   Android 17 it is forked into init's global mount namespace, where module mounts
   are still listed in its own `/proc/self/mountinfo`.
 
+## Dirty sepolicy
+
+`SepolicyProbeService` (`useAppZygote="true"`) ports
+[LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) — see that project's README
+for the mechanism and credits. `SELinux.java` is a verbatim copy of its `/sys/fs/selinux`
+wrapper; `SepolicyZygote.java` adapts its `AppZygote.doPreload()` check to Demo's JSON report
+shape.
+
 ## Known limitation
 
 A bind over `/apex/com.android.art/bin/dex2oat*`, the ART-compile hook used by
 [Vector](https://github.com/JingMatrix/Vector), is out of reach. SELinux denies apps `getattr` on
 `dex2oat_exec`, so `stat` cannot see it, and it never propagates into the app's
 own mount namespace.
+
+Before Android 12, a stray netlink fd `selinux_check_access` opens during `doPreload` isn't
+marked safe across the app zygote fork and can crash it (DirtySepolicy's own README) — a
+known fragility on Demo's `minSdk` 29, not something worth a native workaround here.
